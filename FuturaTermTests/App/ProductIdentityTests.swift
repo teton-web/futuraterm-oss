@@ -48,23 +48,27 @@ struct ProductIdentityTests {
     }
 
     @Test
-    func license_is_mit_and_has_no_thdxg() throws {
+    func license_is_mit_and_credits_upstream() throws {
         let url = try #require(Self.repoFile("LICENSE"), "LICENSE not found walking up from #filePath")
         let license = try String(contentsOf: url, encoding: .utf8)
         #expect(license.contains("MIT License"))
         #expect(license.contains("Copyright (c) 2026 FuturaTerm"))
+        #expect(license.contains("Copyright (c) 2026 Macterm"))
         #expect(license.contains("Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors"))
         #expect(license.contains("Copyright (c) 2025 Eric Bower"))
-        #expect(!license.contains("Macterm"))
         #expect(!license.contains("thdxg"))
     }
 
     @Test
-    func readme_has_no_thdxg_or_origin_links() throws {
+    func readme_credits_macterm_without_origin_links() throws {
         let url = try #require(Self.repoFile("README.md"), "README.md not found walking up from #filePath")
         let readme = try String(contentsOf: url, encoding: .utf8)
+        #expect(readme.contains("FuturaTerm"))
+        #expect(readme.contains("https://github.com/davidsolheim/futuraterm.git"))
+        #expect(readme.contains("Portions derived from MacTerm, MIT, Copyright (c) 2026 Macterm"))
         #expect(!readme.contains("thdxg"))
         #expect(!readme.contains("ORIGIN.md"))
+        #expect(!readme.contains("screenshot.png"))
     }
 
     /// Walk parent directories of this source file until `LICENSE` marks the
