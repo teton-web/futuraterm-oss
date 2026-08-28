@@ -96,7 +96,7 @@ If any of these fail in CI, your PR will be blocked. Running them locally first 
 ## Docs
 
 - `CLAUDE.md` is a symlink to [`AGENTS.md`](AGENTS.md) — edit `AGENTS.md`.
-- User-facing docs live in [`website/docs/pages/`](website/docs/pages) as Markdown, one file per page. `cd website && bun install && bun run dev` builds and serves the site locally (needs [Bun](https://bun.sh) and [Caddy](https://caddyserver.com)).
+- User-facing docs live at [futuraterm.com/docs](https://futuraterm.com/docs).
 
 ## Reporting Issues
 
