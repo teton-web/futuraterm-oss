@@ -1,0 +1,281 @@
+name: Release
+
+# Triggered by publishing a GitHub Release (not a bare tag push), so the
+# release's `prerelease` flag — a first-class boolean — gates the stable
+# distribution channels. A prerelease still builds and attaches DMGs for
+# testers, but skips the appcast (auto-update feed) and the Homebrew tap.
+# Disabled FuturaTerm release: signing, Sparkle appcast, and Homebrew tap
+# are not wired. Re-enable only after FuturaTerm's own signing keys and
+# feeds exist — do not restore on: release until then.
+on:
+  workflow_dispatch:
+
+jobs:
+  # Resolve the prerelease flag ONCE, live, from the release itself — never from
+  # `github.event.release.prerelease`.
+  #
+  # The payload is a snapshot frozen when the event was dispatched, and editing a
+  # release does not re-fire `published`. Promote a prerelease to stable in the
+  # same breath as publishing it and every job reads the STALE value: v1.21.0
+  # shipped that way (2026-08-01, run 30699334224) — the release record said
+  # `prerelease: false`, the payload said true, so `bump-cask` skipped and the
+  # appcast never got an item. Don't expect the old giveaway — the run's display
+  # title showing a pre-edit release name against the real tag ("FuturaTerm v1.20.11"
+  # on tag v1.21.0). It renders LIVE from the release name, so it re-wrote itself
+  # to `v1.21.0` the moment that release was retitled, and release names are now
+  # just the tag anyway, so the two can no longer visibly disagree. What a repeat
+  # looks like today is silent: a skipped `bump-cask` and an appcast with no item.
+  #
+  # `gh release view` asks the API for current truth, so this is correct no matter
+  # which activity type fired or how the release was edited beforehand. Preferred
+  # over adding `released` to `types:` because that only patches the one path we
+  # happened to hit, and GitHub's own docs don't state whether `released` fires on
+  # an edit-to-promote at all — the guess that "the event surely reflects the
+  # release" is what caused this bug, so don't re-make it in a new spot.
+  flag:
+    runs-on: ubuntu-latest
+    # Explicit: reading a release only needs contents:read, and declaring it
+    # keeps the job working if the repo's default workflow token is ever
+    # tightened.
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      prerelease: ${{ steps.read.outputs.prerelease }}
+    steps:
+      - name: Read live prerelease flag
+        id: read
+        run: |
+          PRERELEASE=$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')
+          # Fail loudly rather than defaulting: a silent "false" would leak a
+          # beta into the stable channel and the Homebrew tap.
+          if [[ "$PRERELEASE" != "true" && "$PRERELEASE" != "false" ]]; then
+            echo "error: could not read prerelease flag for '$GITHUB_REF_NAME' (got '$PRERELEASE')" >&2
+            exit 1
+          fi
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "Live prerelease flag for $GITHUB_REF_NAME: $PRERELEASE"
+
+  build:
+    needs: flag
+    runs-on: macos-26
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: jdx/mise-action@v4.2.5
+
+      # ISO week (YYYY-Www) — makes the GhosttyKit cache self-refresh weekly.
+      - name: Cache epoch
+        id: epoch
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      # GhosttyKit + bundled resources + zmx: shared verbatim with the test and
+      # benchmark workflows (identical key), so a release rides the cache they
+      # keep warm. Only the source-independent download is cached — NOT
+      # DerivedData: a release is a clean universal Release build so the shipped
+      # binary can't inherit a stale incremental artifact.
+      - name: Cache GhosttyKit
+        uses: actions/cache@v6
+        with:
+          path: |
+            GhosttyKit.xcframework
+            FuturaTerm/Resources/ghostty
+            FuturaTerm/Resources/terminfo
+            FuturaTerm/Resources/zmx
+            .ghosttykit-tag
+          # The tag stamp is cached with the artifacts it describes (test.yml).
+          #
+          # NO restore-keys fallback: pairing a time-rolling key with a prefix
+          # restore-key re-saves stale content under the fresh key forever (see
+          # test.yml). Without it a new week re-downloads the current `latest`.
+          key: ghosttykit-${{ hashFiles('scripts/setup.sh') }}-${{ steps.epoch.outputs.week }}
+
+      - name: Setup GhosttyKit
+        run: mise run setup --verbose
+
+      # Import the stable self-signed release certificate and hand its identity
+      # to build.sh via FUTURATERM_CODESIGN_IDENTITY. macOS TCC keys privacy
+      # grants (Documents, Downloads, …) to the app's code-signing designated
+      # requirement; ad-hoc signing (what releases shipped with before) bakes
+      # the per-build CDHash into that requirement, so every update looked like
+      # a new app and dropped every grant. Signing every release with ONE
+      # certificate keeps the requirement stable, so grants survive updates.
+      # Gatekeeper is unchanged (still self-signed, still needs the first-install
+      # xattr) — TCC doesn't require a trusted anchor, only the same cert.
+      #
+      # Missing secrets FAIL the release rather than falling back to ad-hoc: a
+      # silent fallback would ship an update that resets every user's grants
+      # once more, which is exactly the bug this exists to fix — and the next
+      # properly-signed release would reset them yet again. The generation
+      # recipe lives in AGENTS.md's Releasing section (a once-a-decade ceremony,
+      # so no script); never rotate the cert casually (a new cert is one more
+      # reset), and back it up like the Sparkle private key.
+      - name: Import signing certificate
+        env:
+          FUTURATERM_SIGNING_CERT_P12: ${{ secrets.FUTURATERM_SIGNING_CERT_P12 }}
+          FUTURATERM_SIGNING_CERT_PASSWORD: ${{ secrets.FUTURATERM_SIGNING_CERT_PASSWORD }}
+        run: |
+          P12_B64="${FUTURATERM_SIGNING_CERT_P12:-}"
+          P12_PASS="${FUTURATERM_SIGNING_CERT_PASSWORD:-}"
+          if [[ -z "$P12_B64" || -z "$P12_PASS" ]]; then
+            echo "error: FUTURATERM_SIGNING_CERT_P12 / FUTURATERM_SIGNING_CERT_PASSWORD secrets are not set." >&2
+            echo "Releases are signed with a stable certificate so users' privacy grants survive" >&2
+            echo "updates. Follow the recipe in AGENTS.md's Releasing section to create the cert" >&2
+            echo "and add them as GitHub Actions secrets on this repository." >&2
+            exit 1
+          fi
+          export P12_PASS
+          KEYCHAIN="$RUNNER_TEMP/futuraterm-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          P12="$RUNNER_TEMP/futuraterm-signing.p12"
+          printf '%s' "$P12_B64" | base64 --decode > "$P12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$P12" -k "$KEYCHAIN" -f pkcs12 \
+            -P "$P12_PASS" -T /usr/bin/codesign
+          # Let codesign reach the key headlessly (no UI to answer a prompt).
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          # Trust settings don't travel inside a .p12, and codesign refuses an
+          # identity whose chain doesn't end at a trusted anchor — so trust the
+          # self-signed cert explicitly (runners have passwordless sudo).
+          CERT_PEM="$RUNNER_TEMP/futuraterm-signing.pem"
+          /usr/bin/openssl pkcs12 -in "$P12" -clcerts -nokeys \
+            -passin env:P12_PASS -out "$CERT_PEM"
+          sudo security add-trusted-cert -d -r trustRoot \
+            -k /Library/Keychains/System.keychain "$CERT_PEM"
+          # Resolve the identity by hash (unambiguous even if a runner image
+          # ever ships a similarly named cert). find-identity -v requires the
+          # trust added above, so a bad import fails HERE, not mid-build.
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk '$2 ~ /^[0-9A-F]{40}$/ {print $2; exit}')"
+          if [[ -z "$IDENTITY" ]]; then
+            echo "error: imported certificate is not a valid code-signing identity:" >&2
+            security find-identity -p codesigning "$KEYCHAIN" >&2
+            exit 1
+          fi
+          echo "FUTURATERM_CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          rm -f "$P12" "$CERT_PEM"
+
+      - name: Build universal release artifact
+        env:
+          SPARKLE_ED_PUBLIC_KEY: ${{ secrets.SPARKLE_ED_PUBLIC_KEY }}
+          PRERELEASE: ${{ needs.flag.outputs.prerelease }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # A `-beta.N` suffix is accepted ONLY on a release flagged prerelease,
+          # so a stable release can never ship a beta version string (and a beta
+          # tag can't sneak into the stable channel by forgetting the flag).
+          if [[ "$PRERELEASE" == "true" ]]; then
+            PATTERN='^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$'
+            EXPECTED="vX.Y.Z or vX.Y.Z-beta.N"
+          else
+            PATTERN='^[0-9]+\.[0-9]+\.[0-9]+$'
+            EXPECTED="vX.Y.Z"
+          fi
+          if ! [[ "$VERSION" =~ $PATTERN ]]; then
+            echo "error: tag '$GITHUB_REF_NAME' is not $EXPECTED; refusing to build a placeholder release" >&2
+            exit 1
+          fi
+          if [[ -z "$SPARKLE_ED_PUBLIC_KEY" || "$SPARKLE_ED_PUBLIC_KEY" == "SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER" ]]; then
+            echo "error: SPARKLE_ED_PUBLIC_KEY is missing or still set to the local-build placeholder; refusing to build a release without auto-updates" >&2
+            exit 1
+          fi
+          # Release builds invoke the build script directly to skip the
+          # format/lint/test deps on `mise run build` — main is already
+          # format/lint-gated by checks.yml and test-gated by test.yml before
+          # a tag is cut, so a release just needs the build itself. Equivalent
+          # to the old ci:build.
+          VERSION="$VERSION" ./scripts/build.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dmg
+          path: build/*.dmg
+
+  release:
+    needs: [flag, build]
+    runs-on: macos-26
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Job-level so both the version gate and the appcast step read the same
+      # flag. Sourced from the `flag` job's live API read, not the event payload
+      # (see the comment there). Renders as the string "true"/"false".
+      PRERELEASE: ${{ needs.flag.outputs.prerelease }}
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dmgs
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        id: release
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Mirrors the build job's gate (see the comment there).
+          if [[ "$PRERELEASE" == "true" ]]; then
+            PATTERN='^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$'
+            EXPECTED="vX.Y.Z or vX.Y.Z-beta.N"
+          else
+            PATTERN='^[0-9]+\.[0-9]+\.[0-9]+$'
+            EXPECTED="vX.Y.Z"
+          fi
+          if ! [[ "$VERSION" =~ $PATTERN ]]; then
+            echo "error: tag '$GITHUB_REF_NAME' is not $EXPECTED; refusing to publish a placeholder release" >&2
+            exit 1
+          fi
+          TAG="v${VERSION}"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" dmgs/*.dmg --clobber
+          # Ensure the release is published (not left as draft), and re-assert
+          # the prerelease flag explicitly: publishing a draft in the same call
+          # would otherwise be a chance to drop it, which would leak a beta
+          # into the stable channel on a re-run.
+          gh release edit "$TAG" --draft=false --prerelease="$PRERELEASE"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # ── Appcast generation ────────────────────────────────────────────
+      # Sparkle's `sign_update` produces an EdDSA signature for each DMG.
+      # We then append a new <item> to the appcast on the gh-pages branch.
+      #
+      # BOTH stable and prerelease publish here now — one feed, two channels.
+      # A prerelease's <item> carries <sparkle:channel>beta</sparkle:channel>,
+      # which Sparkle hides from any updater that hasn't opted into the `beta`
+      # channel. Homebrew cask publish is not wired for FuturaTerm.
+
+      - name: Install Sparkle tools
+        run: |
+          SPARKLE_VERSION="2.9.1"
+          curl -fsSL "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz" -o sparkle.tar.xz
+          mkdir -p sparkle && tar -xf sparkle.tar.xz -C sparkle
+          echo "$PWD/sparkle/bin" >> "$GITHUB_PATH"
+
+      - name: Publish appcast to gh-pages
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: scripts/publish-appcast.sh dmgs

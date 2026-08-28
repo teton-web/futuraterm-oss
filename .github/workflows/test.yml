@@ -1,0 +1,226 @@
+name: Test
+
+# All testing CI lives here so check names group in the PR UI as
+# "Test / Unit" and "Test / End-to-end" (the workflow name is the prefix;
+# the job name is the required-status-check context). Style gates stay in
+# checks.yml; the resource benchmark has its own workflow (artifact/report
+# plumbing).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      swift: ${{ steps.filter.outputs.swift }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            swift:
+              - "**/*.swift"
+              - "project.yml"
+              - "mise.toml"
+              - "scripts/**"
+              - "e2e/**"
+              - ".github/workflows/test.yml"
+              - "FuturaTerm/Info.plist"
+              - "FuturaTerm/FuturaTerm.entitlements"
+
+  unit:
+    name: Unit
+    needs: changes
+    if: needs.changes.outputs.swift == 'true'
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: jdx/mise-action@v4.2.5
+
+      # ISO week (YYYY-Www) — makes the GhosttyKit cache self-refresh weekly.
+      - name: Cache epoch
+        id: epoch
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      # GhosttyKit + bundled resources + zmx: the source-independent download
+      # (setup.sh). setup.sh is a presence check, so a restored cache makes it a
+      # no-op. Keyed on setup.sh's hash + the ISO week so a new upstream ghostty
+      # release (setup.sh pulls `latest`) is actually picked up within a week.
+      #
+      # NO `restore-keys` fallback ON PURPOSE: pairing a time-rolling key with a
+      # prefix restore-key re-baptizes last week's content under the fresh key
+      # forever (the week rolls → exact key misses → prefix restores the stale
+      # cache → the presence-check setup no-ops → actions/cache saves the SAME
+      # stale bytes under the new key). Without the fallback, a new week starts
+      # empty, setup re-downloads once, and the fresh content is cached — the
+      # intended "picked up within a week" behavior. Shared verbatim with the
+      # benchmark and release workflows.
+      - name: Cache GhosttyKit
+        uses: actions/cache@v6
+        with:
+          path: |
+            GhosttyKit.xcframework
+            FuturaTerm/Resources/ghostty
+            FuturaTerm/Resources/terminfo
+            FuturaTerm/Resources/zmx
+            .ghosttykit-tag
+          # The tag stamp is cached WITH the artifacts it describes. setup.sh
+          # reads a missing stamp as "provenance unknown" and warns, which a
+          # restored tree is not — this key hashes setup.sh, so the pin these
+          # artifacts came from is exactly the one it names. Without the stamp
+          # in here that warning would fire on every cache hit.
+          key: ghosttykit-${{ hashFiles('scripts/setup.sh') }}-${{ steps.epoch.outputs.week }}
+
+      # Runs BEFORE the DerivedData cache, which keys on what this installs.
+      - name: Setup GhosttyKit
+        run: mise run setup --verbose
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Debug build products, keyed on the GhosttyKit ACTUALLY INSTALLED above,
+      # so they can never be paired with a framework they weren't compiled
+      # against. Separate key prefix from the benchmark's Release cache: same
+      # on-disk path (build/DerivedData), different namespace, so the two
+      # configs never clobber each other.
+      #
+      # A PINNED RELEASE IS NOT IMMUTABLE — that's what makes the framework hash
+      # load-bearing rather than belt-and-braces. thdxg/ghostty replaced
+      # build-2026-08-02's assets at 08:32Z, hours after CI had cached the
+      # earlier bytes under that same tag. The GhosttyKit key rolls weekly with
+      # no restore-keys, so when the ISO week turned over the next run
+      # re-downloaded the identical tag and got DIFFERENT bytes, while a broad
+      # `derived-debug-` restore-key handed the build a GhosttyKit .pcm
+      # precompiled against the old header (issue #208, run 30790705828):
+      #
+      #   error: file '.../include/ghostty.h' has been modified since the module
+      #   file '.../GhosttyKit-<hash>.pcm' was built
+      #   note: precompiled file '...pcm' needs to be rebuilt
+      #
+      # Two properties of that failure are worth keeping in mind here. Only the
+      # test target broke — the app target got rebuilt, so the e2e job in the
+      # same run passed and the signal looked like a test-only problem. And the
+      # poisoned .pcm was restored *and re-saved* on every attempt, so
+      # `gh run rerun` reproduced it exactly; clearing it took deleting every
+      # derived-debug-* entry by hand. So a stale cache can break the build
+      # outright, not merely slow it down (this step used to claim otherwise),
+      # and the fallback keys must never reach across a framework change.
+      #
+      # The hash can only be taken after setup — it's the *downloaded*
+      # framework — which is why this is a restore/save split instead of one
+      # `cache` step. It also can't be hoisted into a job-level `env`: that
+      # evaluates before any step runs and would hash nothing. The glob stays
+      # slice-agnostic for the reason setup.sh globs rather than naming a slice.
+      #
+      # Header only, not the whole xcframework: ghostty.h is the input a .pcm
+      # records and therefore the one whose change hard-fails the build, while
+      # hashing the per-slice static archives would add hundreds of MB of
+      # hashing to every job to catch a stale *relink* — which xcodebuild
+      # already handles, tracking the archives as link inputs.
+      - name: Restore DerivedData (Debug)
+        id: derived
+        uses: actions/cache/restore@v6
+        with:
+          path: build/DerivedData
+          key: derived-debug-${{ hashFiles('GhosttyKit.xcframework/*/Headers/ghostty.h') }}-${{ hashFiles('**/*.swift', 'project.yml') }}-${{ github.run_id }}
+          restore-keys: |
+            derived-debug-${{ hashFiles('GhosttyKit.xcframework/*/Headers/ghostty.h') }}-${{ hashFiles('**/*.swift', 'project.yml') }}-
+            derived-debug-${{ hashFiles('GhosttyKit.xcframework/*/Headers/ghostty.h') }}-
+
+      - name: Test
+        run: mise run test --verbose
+
+      # Saves under the key resolved at restore time, NOT a re-evaluated
+      # expression — `**/*.swift` would otherwise pick up whatever the build
+      # just wrote under build/DerivedData. Success-only (the default `if`), so
+      # a failed build never persists its products for the next run to inherit.
+      # The sibling e2e job saves this same key; the loser of that race gets a
+      # harmless "cache already exists" warning.
+      - name: Save DerivedData (Debug)
+        uses: actions/cache/save@v6
+        with:
+          path: build/DerivedData
+          key: ${{ steps.derived.outputs.cache-primary-key }}
+
+  # End-to-end: build the Debug app, launch it hermetically (the benchmark's
+  # TCC-free recipe — Darwin notifications + LaunchServices activation, see
+  # scripts/_harness.py), and drive it through the bundled `futuraterm` CLI's
+  # control socket, asserting on libghostty's own state (`pane dump`/`list`).
+  # A separate job from `unit` so the slower GUI run never delays the fast
+  # unit signal and failures are attributable at a glance.
+  e2e:
+    name: End-to-end
+    needs: changes
+    if: needs.changes.outputs.swift == 'true'
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: jdx/mise-action@v4.2.5
+
+      # ISO week (YYYY-Www) — makes the GhosttyKit cache self-refresh weekly.
+      - name: Cache epoch
+        id: epoch
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      # Same key as the unit job (see its comment for the no-restore-keys
+      # rationale), so all consumers feed one GhosttyKit cache entry.
+      - name: Cache GhosttyKit
+        uses: actions/cache@v6
+        with:
+          path: |
+            GhosttyKit.xcframework
+            FuturaTerm/Resources/ghostty
+            FuturaTerm/Resources/terminfo
+            FuturaTerm/Resources/zmx
+            .ghosttykit-tag
+          key: ghosttykit-${{ hashFiles('scripts/setup.sh') }}-${{ steps.epoch.outputs.week }}
+      # Runs BEFORE the DerivedData cache, which keys on what this installs.
+      - name: Setup GhosttyKit
+        run: mise run setup --verbose
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Shares the unit job's Debug DerivedData namespace — same configuration,
+      # same on-disk path, so the same framework-hash key (see the unit job for
+      # why that hash is load-bearing and why it has to be read after setup).
+      # This job is how the incident spread: it builds only the app target, so
+      # it succeeded while carrying forward the stale test-target .pcm it never
+      # touched, and its save re-published the poison under a fresh key.
+      - name: Restore DerivedData (Debug)
+        id: derived
+        uses: actions/cache/restore@v6
+        with:
+          path: build/DerivedData
+          key: derived-debug-${{ hashFiles('GhosttyKit.xcframework/*/Headers/ghostty.h') }}-${{ hashFiles('**/*.swift', 'project.yml') }}-${{ github.run_id }}
+          restore-keys: |
+            derived-debug-${{ hashFiles('GhosttyKit.xcframework/*/Headers/ghostty.h') }}-${{ hashFiles('**/*.swift', 'project.yml') }}-
+            derived-debug-${{ hashFiles('GhosttyKit.xcframework/*/Headers/ghostty.h') }}-
+
+      - name: End-to-end tests
+        run: mise run e2e --verbose
+
+      # Screenshot, unified log, and per-pane terminal text captured by the
+      # suite's failure fixtures (e2e/conftest.py).
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-diagnostics
+          path: build/e2e/diagnostics/
+          if-no-files-found: ignore
+
+      - name: Save DerivedData (Debug)
+        uses: actions/cache/save@v6
+        with:
+          path: build/DerivedData
+          key: ${{ steps.derived.outputs.cache-primary-key }}
