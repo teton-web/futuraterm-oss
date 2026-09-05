@@ -1,0 +1,62 @@
+# PR auto-labels by file paths touched.
+# See https://github.com/actions/labeler
+
+"area:ui":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "FuturaTerm/Views/**"
+          - "FuturaTerm/Settings/**"
+
+"area:terminal":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "FuturaTerm/Views/Terminal/**"
+          - "FuturaTerm/Ghostty/**"
+
+"area:palette":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "FuturaTerm/Palette/**"
+
+"area:state":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "FuturaTerm/App/AppState.swift"
+          - "FuturaTerm/Model/**"
+          - "FuturaTerm/Persistence/**"
+
+"area:hotkeys":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "FuturaTerm/App/Hotkeys.swift"
+          - "FuturaTerm/App/KeyRouter.swift"
+          - "FuturaTerm/App/Responders.swift"
+
+"area:config":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "FuturaTerm/Config/**"
+
+"area:tests":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "FuturaTermTests/**"
+
+"area:ci":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/workflows/**"
+          - "mise.toml"
+          - "scripts/**"
+
+"area:docs":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.md"
+          - "docs/**"
+
+"area:release":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/workflows/release.yml"
+          - "FuturaTerm/Info.plist"

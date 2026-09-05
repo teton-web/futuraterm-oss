@@ -1,0 +1,294 @@
+name: FuturaTerm
+options:
+  bundleIdPrefix: com.davidsolheim
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  defaultConfig: Release
+  generateEmptyDirectories: true
+
+configs:
+  Debug: debug
+  Release: release
+  AppStore: release
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SDKROOT: macosx
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    ONLY_ACTIVE_ARCH: NO
+    SWIFT_STRICT_CONCURRENCY: complete
+    DEAD_CODE_STRIPPING: YES
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+    CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+    CLANG_CXX_LIBRARY: "libc++"
+  configs:
+    Debug:
+      ONLY_ACTIVE_ARCH: YES
+    Release:
+      ONLY_ACTIVE_ARCH: NO
+
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: "2.6.0"
+  Yams:
+    url: https://github.com/jpsim/Yams
+    from: "5.0.0"
+  ArgumentParser:
+    url: https://github.com/apple/swift-argument-parser
+    from: "1.3.0"
+
+targets:
+  FuturaTerm:
+    type: application
+    platform: macOS
+    sources:
+      - path: FuturaTerm
+        excludes:
+          - "Info.plist"
+          - "FuturaTerm.entitlements"
+          - "FuturaTerm.mas.entitlements"
+          - "Resources/ghostty"
+          - "Resources/terminfo"
+          - "Resources/zmx"
+          - "AppIcon.icon"
+      # Ghostty resources (themes + shell-integration), downloaded by setup.sh.
+      # Folder reference (not the default "group") because the contents are
+      # extensionless files Xcode would otherwise skip. Lands at
+      # Contents/Resources/ghostty — GHOSTTY_RESOURCES_DIR points here, matching
+      # a real Ghostty.app so libghostty resolves themes/shell-integration and
+      # derives TERMINFO as ../terminfo (the sibling dir below).
+      - path: FuturaTerm/Resources/ghostty
+        type: folder
+        buildPhase: resources
+      # Compiled terminfo DB (downloaded by setup.sh) so TERM=xterm-ghostty
+      # resolves without a Ghostty.app install. Folder reference preserves the
+      # hashed macOS layout (terminfo/78/xterm-ghostty) and extensionless files.
+      # MUST land at Contents/Resources/terminfo — a SIBLING of ghostty/ — so
+      # libghostty's dirname(GHOSTTY_RESOURCES_DIR)/terminfo derivation hits it.
+      - path: FuturaTerm/Resources/terminfo
+        type: folder
+        buildPhase: resources
+      # Icon Composer file. Xcode 26 prefers this over an Assets.xcassets
+      # AppIcon.appiconset when ASSETCATALOG_COMPILER_APPICON_NAME matches the
+      # filename — actool generates .icns + alternate appearances (light, dark,
+      # tinted, clear) automatically from the layered .icon source.
+      - path: FuturaTerm/AppIcon.icon
+        type: file
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.davidsolheim.futuraterm
+        PRODUCT_NAME: FuturaTerm
+        PRODUCT_MODULE_NAME: FuturaTerm
+        INFOPLIST_FILE: FuturaTerm/Info.plist
+        CODE_SIGN_ENTITLEMENTS: FuturaTerm/FuturaTerm.entitlements
+        # Tells actool to render FuturaTerm/AppIcon.icon (Icon Composer source)
+        # for the app icon. Matches the filename without the .icon extension.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Marketing version & build number are written by the release script
+        # via xcodebuild -override; defaults below apply for local dev builds.
+        MARKETING_VERSION: "0.1.1"
+        CURRENT_PROJECT_VERSION: "0.1.1.9999"
+        # Public Sparkle key is overridden in CI release builds. Updater.swift
+        # treats this placeholder as an explicit local-build disable switch.
+        SPARKLE_ED_PUBLIC_KEY: SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER
+        GIT_COMMIT: GIT_COMMIT_PLACEHOLDER
+        # Bundle identifier of the in-bundle frameworks (Sparkle).
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"
+        ENABLE_HARDENED_RUNTIME: YES
+        OTHER_LDFLAGS:
+          - "-lc++"
+        # Silence "umbrella header does not include header" warnings emitted
+        # when Clang imports the GhosttyKit module — ghostty.h doesn't list
+        # the vt/* sub-headers, and we can't modify the prebuilt xcframework.
+        OTHER_SWIFT_FLAGS:
+          - "-Xcc"
+          - "-Wno-incomplete-umbrella"
+        # Exposes the ObjC exception trampoline (System/ObjCExceptionCatcher.h)
+        # to Swift — @try/@catch has no Swift equivalent, and an uncaught
+        # NSException kills the app without a crash report. ARC is pinned on
+        # explicitly since the target now compiles an .m file.
+        SWIFT_OBJC_BRIDGING_HEADER: FuturaTerm/FuturaTerm-Bridging-Header.h
+        CLANG_ENABLE_OBJC_ARC: YES
+        # Display name (Dock / menu bar / Finder) — wired into Info.plist's
+        # CFBundleDisplayName. Debug builds use a distinct name so App Support
+        # and LaunchServices stay split from the release app.
+        PRODUCT_DISPLAY_NAME: FuturaTerm
+      configs:
+        Debug:
+          # Distinct bundle ID, display name, AND product name so Debug
+          # registers as FuturaTermDebug.app — not FuturaTerm.app — and can
+          # sit next to a Release install with no LaunchServices bleed.
+          # PRODUCT_MODULE_NAME stays FuturaTerm (Swift module).
+          PRODUCT_BUNDLE_IDENTIFIER: com.davidsolheim.futuraterm.debug
+          PRODUCT_DISPLAY_NAME: FuturaTerm Debug
+          PRODUCT_NAME: FuturaTermDebug
+          OTHER_LDFLAGS:
+            - "$(inherited)"
+            - "-lc++"
+            - "-framework"
+            - "Sparkle"
+          # CONFIGURATION_BUILD_DIR holds Sparkle.framework for both a normal
+          # build and an archive (SPM copies the slice there). The
+          # `$BUILD_DIR/../../SourcePackages` path is the regular-build SPM
+          # artifact; it does not resolve during `xcodebuild archive`.
+          FRAMEWORK_SEARCH_PATHS:
+            - "$(inherited)"
+            - "$(CONFIGURATION_BUILD_DIR)"
+            - "$(BUILD_DIR)/../../SourcePackages/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64"
+        Release:
+          OTHER_LDFLAGS:
+            - "$(inherited)"
+            - "-lc++"
+            - "-framework"
+            - "Sparkle"
+          FRAMEWORK_SEARCH_PATHS:
+            - "$(inherited)"
+            - "$(CONFIGURATION_BUILD_DIR)"
+            - "$(BUILD_DIR)/../../SourcePackages/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64"
+        AppStore:
+          # MAS compile flag + sandbox entitlements. Debug/Release stay on
+          # FuturaTerm.entitlements and must not define APP_STORE.
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: APP_STORE
+          CODE_SIGN_ENTITLEMENTS: FuturaTerm/FuturaTerm.mas.entitlements
+          # App Store CFBundleVersion is ≤3 period-separated integers.
+          # Base CURRENT_PROJECT_VERSION is Sparkle's 4-component form.
+          CURRENT_PROJECT_VERSION: "0.1.1"
+    dependencies:
+      # Build ordering only: the post-build script copies the CLI binary into
+      # the bundle, so it must exist before the app target finishes.
+      - target: FuturaTermCLI
+        embed: false
+      - framework: GhosttyKit.xcframework
+        embed: false
+      # Do not link or embed via the package product: Xcode still copies a
+      # linked dynamic SPM framework after Run Scripts, which put Sparkle
+      # back in AppStore products. Direct adds -framework Sparkle below.
+      - package: Sparkle
+        product: Sparkle
+        link: false
+        embed: false
+      - package: Yams
+        product: Yams
+      - sdk: AppKit.framework
+      - sdk: Carbon.framework
+      - sdk: CoreGraphics.framework
+      - sdk: CoreText.framework
+      - sdk: Foundation.framework
+      - sdk: IOKit.framework
+      - sdk: IOSurface.framework
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: QuartzCore.framework
+      - sdk: UserNotifications.framework
+    postCompileScripts:
+      # Copy the prebuilt zmx binary (downloaded by setup.sh from davidsolheim/futuraterm-zmx
+      # release, like GhosttyKit) into the app bundle at
+      # Contents/Resources/zmx/zmx — ZmxClient resolves it via Bundle.main.
+      # Runs after compile so the bundle's Resources dir exists.
+      - script: "${SRCROOT}/scripts/embed-zmx.sh"
+        name: "Embed zmx"
+        basedOnDependencyAnalysis: false
+    postBuildScripts:
+      # Bundle the control CLI at Contents/Resources/bin/futuraterm. The app
+      # prepends this dir to PATH for spawned shells; scripts outside the app
+      # (the CI benchmark) invoke it by bundle path.
+      #
+      # Also bundle the `ghostty` shim at Contents/Resources/ssh-bridge/
+      # (FuturaTermConfig.sshShimDirectory) — FuturaTermConfig.regenerate points
+      # GHOSTTY_BIN_DIR there so the shell-integration ssh wrapper's
+      # `"$GHOSTTY_BIN_DIR/ghostty" +ssh` resolves to `futuraterm ssh` (see
+      # scripts/ghostty-shim.sh). Deliberately NOT Resources/bin or
+      # Contents/MacOS: both land on pane PATHs (EnvironmentSetup prepends
+      # bin; libghostty appends the exe dir), and the shim must never be
+      # reachable as a bare `ghostty`.
+      - name: "Bundle futuraterm CLI"
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          BIN_DIR="$BUILT_PRODUCTS_DIR/$CONTENTS_FOLDER_PATH/Resources/bin"
+          mkdir -p "$BIN_DIR"
+          cp "$BUILT_PRODUCTS_DIR/futuraterm" "$BIN_DIR/futuraterm"
+          SHIM_DIR="$BUILT_PRODUCTS_DIR/$CONTENTS_FOLDER_PATH/Resources/ssh-bridge"
+          mkdir -p "$SHIM_DIR"
+          cp "$SRCROOT/scripts/ghostty-shim.sh" "$SHIM_DIR/ghostty"
+          chmod +x "$SHIM_DIR/ghostty"
+      # xcodegen cannot omit an SPM product per configuration, so AppStore
+      # still lists Sparkle at generate time. The script strips it (and its
+      # XPCs / load commands) from AppStore products and embeds it for Direct.
+      # Lookup walks up from BUILD_DIR so `xcodebuild archive` finds the
+      # artifact — `$BUILD_DIR/../../SourcePackages` only works for a normal
+      # build (see scripts/embed-sparkle.sh).
+      - name: "Strip Sparkle from AppStore"
+        basedOnDependencyAnalysis: false
+        script: "${SRCROOT}/scripts/embed-sparkle.sh"
+
+  # The bundled control CLI (`futuraterm`). Shares ControlProtocol.swift with
+  # the app target so the wire codec can never drift between the two, and
+  # SSHWrapper.swift so `futuraterm ssh` and the app promise the same terminfo
+  # entry (both files are unit-tested through the app module).
+  FuturaTermCLI:
+    type: tool
+    platform: macOS
+    sources:
+      - path: CLI
+      - path: FuturaTerm/Control/ControlProtocol.swift
+      - path: FuturaTerm/Control/ControlReadiness.swift
+      - path: FuturaTerm/System/SSHWrapper.swift
+    dependencies:
+      - package: ArgumentParser
+        product: ArgumentParser
+    settings:
+      base:
+        PRODUCT_NAME: futuraterm
+        # The binary is `futuraterm` but the MODULE must not collide with the
+        # app's `FuturaTerm` module (case-insensitive .swiftmodule paths in the
+        # shared products dir would otherwise clash).
+        PRODUCT_MODULE_NAME: FuturaTermCLI
+        PRODUCT_BUNDLE_IDENTIFIER: com.davidsolheim.futuraterm.cli
+
+  FuturaTermTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - FuturaTermTests
+    dependencies:
+      - target: FuturaTerm
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.davidsolheim.futuraterm.tests
+        GENERATE_INFOPLIST_FILE: YES
+        # Hosted test bundle: loads into FuturaTerm.app at runtime so
+        # @testable import FuturaTerm sees the module symbols. The app's
+        # AppDelegate detects xctest via XCTestConfigurationFilePath and
+        # skips the heavy launch path (libghostty init, hotkey install,
+        # etc.) so the test runner doesn't time out.
+        BUNDLE_LOADER: "$(TEST_HOST)"
+      configs:
+        Debug:
+          # Hosted tests run Debug, so the host binary is FuturaTermDebug.
+          TEST_HOST: "$(BUILT_PRODUCTS_DIR)/FuturaTermDebug.app/Contents/MacOS/FuturaTermDebug"
+        Release:
+          TEST_HOST: "$(BUILT_PRODUCTS_DIR)/FuturaTerm.app/Contents/MacOS/FuturaTerm"
+
+schemes:
+  FuturaTerm:
+    build:
+      targets:
+        FuturaTerm: all
+        FuturaTermTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - FuturaTermTests
+    archive:
+      config: Release

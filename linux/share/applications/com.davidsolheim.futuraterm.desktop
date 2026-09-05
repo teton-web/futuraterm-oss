@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=FuturaTerm
+GenericName=Terminal
+Comment=Native terminal multiplexer for Omarchy
+Exec=futuraterm
+Icon=com.davidsolheim.futuraterm
+Terminal=false
+StartupNotify=true
+StartupWMClass=com.davidsolheim.futuraterm
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;zmx;omarchy;
+DBusActivatable=true
