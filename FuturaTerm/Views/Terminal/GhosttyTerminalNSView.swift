@@ -1,0 +1,2299 @@
+import AppKit
+import CoreText
+import GhosttyKit
+import QuartzCore
+
+final class GhosttyTerminalNSView: NSView {
+    /// In a `.fullSizeContentView` window AppKit keeps a titlebar-height drag
+    /// band at the top (the area above `contentLayoutRect`), and a click there
+    /// moves the window whenever the hit-tested view answers true — NSView's
+    /// default for non-opaque views. With Hide Title Bar on (#226) the
+    /// terminal's top rows sit inside that band, so the default turned clicks
+    /// there into window drags and the surface never saw them. Ghostty solves
+    /// this by overriding `contentLayoutRect` on its NSWindow subclass; we
+    /// don't own SwiftUI's window class, so we answer per-view instead — same
+    /// idea as Ghostty's `NonDraggableHostingView`. Unconditional: a click on
+    /// the terminal should always be terminal input, never a window drag.
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    // MARK: - Accessibility
+
+    /// Expose the focused terminal as an editable text target to accessibility
+    /// clients such as VoiceOver and dictation tools, matching Ghostty.app.
+    override func isAccessibilityElement() -> Bool {
+        true
+    }
+
+    override func accessibilityRole() -> NSAccessibility.Role? {
+        .textArea
+    }
+
+    override func accessibilityHelp() -> String? {
+        "Terminal content area"
+    }
+
+    /// VoiceOver name for this pane. Falls back to `"Terminal"` when the
+    /// pane has not supplied a `displayTitle` yet (no-surface / pre-configure).
+    override func accessibilityLabel() -> String? {
+        if let title = titleProvider?(), !title.isEmpty {
+            return title
+        }
+        if let title = accessibilityTitleOverride, !title.isEmpty {
+            return title
+        }
+        return "Terminal"
+    }
+
+    override func accessibilityIdentifier() -> String {
+        paneID.uuidString
+    }
+
+    override func accessibilityValue() -> Any? {
+        cachedAccessibilityViewportContents()
+    }
+
+    override func accessibilitySelectedTextRange() -> NSRange {
+        accessibilityViewportSelectedRange()
+    }
+
+    override func setAccessibilitySelectedTextRange(_ range: NSRange) {
+        _ = selectText(range: range)
+    }
+
+    override func accessibilitySelectedText() -> String? {
+        guard let surface else { return nil }
+        var text = ghostty_text_s()
+        guard ghostty_surface_read_selection(surface, &text) else { return nil }
+        defer { ghostty_surface_free_text(surface, &text) }
+        guard let pointer = text.text else { return nil }
+        let selectedText = String(cString: pointer)
+        return selectedText.isEmpty ? nil : selectedText
+    }
+
+    override func accessibilityNumberOfCharacters() -> Int {
+        TerminalAccessibilityText.utf16Count(cachedAccessibilityViewportContents())
+    }
+
+    override func accessibilityVisibleCharacterRange() -> NSRange {
+        NSRange(location: 0, length: accessibilityNumberOfCharacters())
+    }
+
+    override func accessibilityLine(for index: Int) -> Int {
+        TerminalAccessibilityText.line(for: index, in: cachedAccessibilityViewportContents())
+    }
+
+    override func accessibilityRange(forLine line: Int) -> NSRange {
+        TerminalAccessibilityText.range(forLine: line, in: cachedAccessibilityViewportContents())
+    }
+
+    override func accessibilityInsertionPointLineNumber() -> Int {
+        accessibilityLine(for: accessibilitySelectedTextRange().location)
+    }
+
+    override func accessibilityString(for range: NSRange) -> String? {
+        TerminalAccessibilityText.string(for: range, in: cachedAccessibilityViewportContents())
+    }
+
+    override func accessibilityAttributedString(for range: NSRange) -> NSAttributedString? {
+        guard let surface, let plainString = accessibilityString(for: range) else { return nil }
+        var attributes: [NSAttributedString.Key: Any] = [:]
+        if let fontRaw = ghostty_surface_quicklook_font(surface) {
+            let font = Unmanaged<CTFont>.fromOpaque(fontRaw)
+            attributes[.font] = font.takeUnretainedValue()
+            font.release()
+        }
+        return NSAttributedString(string: plainString, attributes: attributes)
+    }
+
+    /// Viewport text VoiceOver reads. Scrollback is not dumped by default.
+    /// 500ms TTL is a cap; `surfaceDidOutputActivity` and selection changes
+    /// drop the cache so a heartbeat never leaves VoiceOver on a stale screen.
+    private func cachedAccessibilityViewportContents() -> String {
+        refreshAccessibilityCacheIfNeeded()
+        return accessibilityScreenContentsCache?.contents ?? ""
+    }
+
+    /// Numbered TUI rows as extra AX buttons on the text area (POR-419).
+    /// AppKit accepts mixed children on an `isAccessibilityElement` text area
+    /// on macOS 14+; if a future OS drops them, fall back to a "Choices"
+    /// `accessibilityCustomRotors` entry rather than replacing the text-area role.
+    override func accessibilityChildren() -> [Any]? {
+        let children = cachedNumberedChoiceAXElements()
+        return children.isEmpty ? nil : children
+    }
+
+    private func cachedNumberedChoiceAXElements() -> [NSAccessibilityElement] {
+        refreshAccessibilityCacheIfNeeded()
+        return accessibilityChoiceChildrenCache
+    }
+
+    private func refreshAccessibilityCacheIfNeeded() {
+        let now = ContinuousClock.now
+        if let cache = accessibilityScreenContentsCache, now < cache.expiresAt {
+            return
+        }
+        let contents = accessibilityViewportOverride ?? readText(scrollback: false) ?? ""
+        accessibilityScreenContentsCache = (contents, now + .milliseconds(500))
+        // Keep the same AX objects while the dump (or the parsed rows) is
+        // unchanged so a pty heartbeat does not churn VoiceOver identities.
+        if contents == lastAccessibilityViewport {
+            return
+        }
+        let choices = NumberedChoiceParser.parse(contents)
+        lastAccessibilityViewport = contents
+        guard choices != accessibilityCachedChoices else { return }
+        accessibilityCachedChoices = choices
+        accessibilityChoiceChildrenCache = makeNumberedChoiceAXElements(choices: choices)
+    }
+
+    /// Builds VoiceOver buttons for a viewport dump. `activate` defaults to
+    /// `activateNumberedChoice` (digit + Return). Tests pass a seam.
+    func makeNumberedChoiceAXElements(
+        from contents: String,
+        activate: (@MainActor (Int) -> Bool)? = nil
+    ) -> [NumberedChoiceAXElement] {
+        makeNumberedChoiceAXElements(
+            choices: NumberedChoiceParser.parse(contents),
+            activate: activate
+        )
+    }
+
+    private func makeNumberedChoiceAXElements(
+        choices: [NumberedChoice],
+        activate: (@MainActor (Int) -> Bool)? = nil
+    ) -> [NumberedChoiceAXElement] {
+        guard !choices.isEmpty else { return [] }
+        let activate = activate ?? { [weak self] index in
+            self?.activateNumberedChoice(index) ?? false
+        }
+        return choices.map { choice in
+            NumberedChoiceAXElement(
+                parent: self,
+                index: choice.index,
+                title: "\(choice.index). \(choice.label)",
+                activate: activate,
+                frame: { [weak self] in
+                    self?.accessibilityFrameForChoice(choice) ?? .zero
+                }
+            )
+        }
+    }
+
+    private func clearAccessibilityCaches() {
+        accessibilityScreenContentsCache = nil
+        lastAccessibilityViewport = nil
+        accessibilityCachedChoices = []
+        accessibilityChoiceChildrenCache = []
+    }
+
+    /// Digit + Return, same path as CLI `pane.choose`.
+    @discardableResult
+    func activateNumberedChoice(_ index: Int) -> Bool {
+        guard let ret = HotkeyRegistry.parseShortcut("return") else { return false }
+        let text = String(index)
+        if let numberedChoiceActivationHandler {
+            return numberedChoiceActivationHandler(text, ret.keyCode, ret.modifiers)
+        }
+        guard sendText(text),
+              sendKey(keyCode: ret.keyCode, mods: ret.modifiers)
+        else { return false }
+        return true
+    }
+
+    /// Screen frame for a 1-based dump cell via the same cell-size math as
+    /// `sendMouseDrag` / `TerminalSelectionMapping.mousePoint`.
+    func accessibilityFrameForChoice(_ choice: NumberedChoice) -> NSRect {
+        guard let size = surfaceSize else { return .zero }
+        let scale = window?.backingScaleFactor ?? 2.0
+        let cellWidth = CGFloat(size.cell_width_px) / scale
+        let cellHeight = CGFloat(size.cell_height_px) / scale
+        let grid = (columns: Int(size.columns), rows: Int(size.rows))
+        let col = min(max(choice.column, 1), max(grid.columns, 1))
+        let row = min(max(choice.line, 1), max(grid.rows, 1))
+        guard let leading = TerminalSelectionMapping.mousePoint(
+            cell: (col, row),
+            grid: grid,
+            cellSize: (cellWidth, cellHeight),
+            anchor: .leading
+        )
+        else { return .zero }
+        let remainingCols = max(grid.columns - col + 1, 1)
+        let width = CGFloat(remainingCols) * cellWidth
+        let viewRect = NSRect(
+            x: leading.x,
+            y: bounds.height - leading.y - cellHeight / 2,
+            width: width,
+            height: cellHeight
+        )
+        let windowRect = convert(viewRect, to: nil)
+        return window?.convertToScreen(windowRect) ?? windowRect
+    }
+
+    /// libghostty `offset_start`/`offset_len` are screen (scrollback) UTF-16
+    /// unless they already fit the viewport string.
+    private func accessibilityViewportSelectedRange() -> NSRange {
+        let screenRange = selectedRange()
+        guard surface != nil else { return NSRange() }
+        let viewport = cachedAccessibilityViewportContents()
+        let screen = readText(scrollback: true) ?? viewport
+        return TerminalAccessibilityText.viewportSelection(
+            screenRange: screenRange,
+            viewport: viewport,
+            screen: screen
+        )
+    }
+
+    /// Weak registry of every live instance so global operations (e.g. config
+    /// reload) can iterate without a central cache.
+    @MainActor private static let liveViews = NSHashTable<GhosttyTerminalNSView>.weakObjects()
+    @MainActor
+    static func allLiveViews() -> [GhosttyTerminalNSView] {
+        liveViews.allObjects
+    }
+
+    nonisolated(unsafe) private(set) var surface: ghostty_surface_t?
+    private let workingDirectory: String
+    /// Command to type into the shell once the surface is created (the pane's
+    /// declared `run`). nil → no injected input.
+    private let command: String?
+    /// Shell binary to launch as the surface's program. nil → libghostty's
+    /// default (resolved from the ghostty config / login shell).
+    private let shell: String?
+    /// Extra environment variables for the spawned shell.
+    private let env: [String: String]?
+    /// The pane's zmx session name. The surface's shell runs under
+    /// `zmx attach <sessionName>` (ghostty `command-wrapper`), so it survives
+    /// app quit and the same name re-attaches the live daemon on relaunch.
+    /// For a remote pane the same name identifies the session on the REMOTE
+    /// host's daemon instead.
+    private let sessionName: String
+    /// Stable identity for view-lifetime coordination. Unlike an object address,
+    /// this cannot be reused when a surface is destroyed and recreated.
+    let paneID: UUID
+
+    /// The parsed `[user@]host:dir` spec when this pane belongs to a remote
+    /// project (#104); nil for local panes. A remote surface runs
+    /// `ssh -t … zmx attach` directly as its command — never under the local
+    /// zmx wrapper (nested zmx is broken upstream) — so all the local
+    /// persistence machinery (wrapper, ZMX_DIR pin, `isZmxWrapped`) stays off.
+    private let remoteSpec: ProjectPath?
+
+    /// Whether this surface belongs to a remote project. Read by the poll
+    /// and title paths, which must not treat the local `ssh` client as the
+    /// pane's real foreground process.
+    var isRemote: Bool { remoteSpec != nil }
+
+    /// Optional explicit remote zmx path (#104), used verbatim in the spawn
+    /// command instead of PATH-resolving `zmx`. nil = PATH lookup.
+    private let remoteZmxPath: String?
+
+    /// Whether this surface actually spawned under the zmx wrapper (false when
+    /// zmx is unbundled or the socket-path budget forced a bypass). Read by
+    /// the resolver-cache retry: only wrapped panes are expected to appear in
+    /// `zmx ls`.
+    private(set) var isZmxWrapped = false
+
+    /// Heap buffers backing the `const char*` fields of the surface config —
+    /// notably `initial_input`, which libghostty writes to the pty
+    /// asynchronously after the child spawns, so the buffer must outlive
+    /// `ghostty_surface_new`. Retained here and freed in `destroySurface`.
+    nonisolated(unsafe) private var configCStrings: [UnsafeMutablePointer<CChar>] = []
+
+    /// The most recent title the surface reported (OSC 0/2 / `SET_TITLE`).
+    /// Remembered so re-wiring `onTitleChange` (when SwiftUI's `configure`
+    /// adopts a warmed surface) replays the latest title once — the surface
+    /// may have reported it before the callback was wired.
+    private var lastReportedTitle: String?
+
+    /// The title already delivered to a callback. The replay in `onTitleChange`'s
+    /// didSet fires ONLY when a title arrived while no callback was wired
+    /// (`lastReportedTitle != lastDeliveredTitle`) — a genuine catch-up. Without
+    /// this, `TerminalSurface.configure` re-assigning the callback on every
+    /// `updateNSView` (focus flips, divider drags) replayed the title each time,
+    /// re-running `receiveReportedTitle` → sysctl + foreground refresh +
+    /// `.terminalPollEvent`, pinning the adaptive poll in its 250ms burst.
+    private var lastDeliveredTitle: String?
+
+    /// Fires on each OSC title with the reported string. Whether the string
+    /// is *used* for naming is the pane's call (`Pane.receiveReportedTitle`
+    /// gates on the foreground process); every arrival also marks a command
+    /// boundary that drives a foreground-process refresh.
+    var onTitleChange: ((String) -> Void)? {
+        didSet {
+            // Replay ASYNC: this setter runs inside TerminalSurface.configure,
+            // i.e. mid SwiftUI view update. A synchronous replay runs a full
+            // foreground refresh whose republishing re-invalidates SwiftUI
+            // from inside its own render transaction — with per-refresh state
+            // flaps that loop never settles (observed twice as a ~90%-CPU
+            // frozen app). Deferring one runloop turn breaks the cycle.
+            //
+            // Replay only when there's a title the current callback hasn't
+            // received yet — not on every re-wire (see `lastDeliveredTitle`).
+            guard let title = lastReportedTitle, title != lastDeliveredTitle,
+                  let callback = onTitleChange
+            else { return }
+            lastDeliveredTitle = title
+            DispatchQueue.main.async { callback(title) }
+        }
+    }
+
+    /// Deliver a title reported by libghostty (OSC 0/2 / `SET_TITLE`).
+    /// Called by `GhosttyCallbacks`.
+    func surfaceDidReportTitle(_ title: String) {
+        lastReportedTitle = title
+        // Only mark it delivered if a callback actually received it — otherwise
+        // a title that arrives before a callback is wired would be recorded as
+        // delivered and the catch-up replay in `onTitleChange`'s didSet would
+        // never fire for it. (Unreachable today, since the callback is wired at
+        // configure time before titles flow, but keeps the two fields honest.)
+        if let onTitleChange {
+            lastDeliveredTitle = title
+            onTitleChange(title)
+        }
+    }
+
+    func surfaceDidReportProgress(running: Bool) {
+        if running {
+            onProgressStarted?()
+        } else {
+            onProgressFinished?()
+        }
+    }
+
+    func surfaceDidUpdateScrollbar(total: UInt64, offset: UInt64, len: UInt64) {
+        // Renderer-driven, so it's suppressed while occluded — it feeds only the
+        // overlay scrollbar UI, never activity detection. Activity comes solely
+        // from the occlusion-independent `surfaceDidOutputActivity` heartbeat,
+        // which also carries row growth.
+        lastScrollbarSnapshot = ScrollbarSnapshot(total: total, offset: offset, len: len)
+        onScrollbarUpdate?(total, offset, len)
+    }
+
+    func surfaceDidRender() {
+        onTerminalRender?()
+    }
+
+    /// The most recent OSC 11 background reported by this surface. It is
+    /// stronger evidence than pixel inference and stays active until the
+    /// surface config changes or the terminal restores its configured color.
+    private(set) var reportedBackgroundColor: NSColor?
+    var sampledDominantBackgroundColor: NSColor?
+
+    func surfaceDidChangeBackgroundColor(_ color: NSColor) {
+        reportedBackgroundColor = color
+        onBackgroundColorChange?(color)
+    }
+
+    func surfaceConfigDidChange(backgroundColor: NSColor?) {
+        guard let reportedBackgroundColor,
+              backgroundColor?.isVisuallyEqual(to: reportedBackgroundColor) != true
+        else { return }
+        self.reportedBackgroundColor = nil
+        AdaptiveTerminalChrome.shared.terminalBackgroundDidReset(in: self)
+    }
+
+    /// Deliver a throttled (~500ms) output heartbeat from the pty IO path
+    /// (`GHOSTTY_ACTION_OUTPUT_ACTIVITY`, wired separately in
+    /// `GhosttyCallbacks`). Unlike `surfaceDidUpdateScrollbar`, this fires
+    /// regardless of occlusion — the renderer doesn't need to be running —
+    /// so it also reaches background/occluded panes. Growth-vs-keepalive
+    /// decisions belong to `TerminalExecutionTracker.markOutputActivity`, not
+    /// here; this method forwards only the total row count that decision needs.
+    func surfaceDidOutputActivity(total: UInt64, offset _: UInt64, len _: UInt64) {
+        accessibilityScreenContentsCache = nil
+        NSAccessibility.post(element: self, notification: .valueChanged)
+        onOutputActivity?(total)
+    }
+
+    /// libghostty has no set-selection C API; a drag (or our synthetic one)
+    /// lands here. Drop the AX cache so the next read is live, and tell
+    /// VoiceOver the selected range moved.
+    func surfaceDidChangeSelection() {
+        accessibilityScreenContentsCache = nil
+        NSAccessibility.post(element: self, notification: .selectedTextChanged)
+    }
+
+    /// Apply the pointer shape libghostty computed for the current mouse
+    /// position. Unknown shapes are ignored (keep the last cursor) — same
+    /// policy as Ghostty.app.
+    func surfaceDidChangeMouseShape(_ shape: ghostty_action_mouse_shape_e) {
+        guard let cursor = Self.cursor(for: shape) else { return }
+        onMouseShapeChange?(cursor)
+    }
+
+    /// The NSCursor for a libghostty mouse shape, or nil for shapes with no
+    /// macOS counterpart. Mirrors Ghostty.app's mapping (Cursor.swift),
+    /// including the macOS 15 directional resize variants.
+    static func cursor(for shape: ghostty_action_mouse_shape_e) -> NSCursor? {
+        switch shape {
+        case GHOSTTY_MOUSE_SHAPE_DEFAULT: return .arrow
+        case GHOSTTY_MOUSE_SHAPE_TEXT: return .iBeam
+        case GHOSTTY_MOUSE_SHAPE_VERTICAL_TEXT: return .iBeamCursorForVerticalLayout
+        case GHOSTTY_MOUSE_SHAPE_POINTER: return .pointingHand
+        case GHOSTTY_MOUSE_SHAPE_GRAB: return .openHand
+        case GHOSTTY_MOUSE_SHAPE_GRABBING: return .closedHand
+        case GHOSTTY_MOUSE_SHAPE_CONTEXT_MENU: return .contextualMenu
+        case GHOSTTY_MOUSE_SHAPE_CROSSHAIR: return .crosshair
+        case GHOSTTY_MOUSE_SHAPE_NOT_ALLOWED: return .operationNotAllowed
+        case GHOSTTY_MOUSE_SHAPE_W_RESIZE:
+            if #available(macOS 15.0, *) { return .columnResize(directions: .left) }
+            return .resizeLeft
+        case GHOSTTY_MOUSE_SHAPE_E_RESIZE:
+            if #available(macOS 15.0, *) { return .columnResize(directions: .right) }
+            return .resizeRight
+        case GHOSTTY_MOUSE_SHAPE_N_RESIZE:
+            if #available(macOS 15.0, *) { return .rowResize(directions: .up) }
+            return .resizeUp
+        case GHOSTTY_MOUSE_SHAPE_S_RESIZE:
+            if #available(macOS 15.0, *) { return .rowResize(directions: .down) }
+            return .resizeDown
+        case GHOSTTY_MOUSE_SHAPE_NS_RESIZE:
+            if #available(macOS 15.0, *) { return .rowResize }
+            return .resizeUpDown
+        case GHOSTTY_MOUSE_SHAPE_EW_RESIZE:
+            if #available(macOS 15.0, *) { return .columnResize }
+            return .resizeLeftRight
+        default:
+            return nil
+        }
+    }
+
+    /// Forward a link-hover change (`GHOSTTY_ACTION_MOUSE_OVER_LINK`). An
+    /// empty URL means the pointer left the link.
+    func surfaceDidHoverLink(_ url: String?) {
+        onLinkHover?(url?.isEmpty == true ? nil : url)
+    }
+
+    /// Record the actual payload resolved for a libghostty clipboard request.
+    /// Unlike key-code inference, this distinguishes real content from an
+    /// empty/whitespace clipboard or a remapped Command-V binding.
+    func surfaceDidPasteText(_ text: String) {
+        recordCommandInput(text)
+        if TerminalCommandSubmission.textContainsNewline(text),
+           TerminalCommandSubmission.textContainsContent(text)
+        {
+            preserveProgrammaticCommandInput(text)
+        }
+    }
+
+    var onFocus: (() -> Void)?
+    var onInteraction: (() -> Void)?
+    /// Bool is best-effort evidence that the submitted prompt contained text.
+    ///
+    /// CALL ORDER: every path that reports a submission fires `onInteraction`
+    /// FIRST. `Pane.recordUserInteraction` clears the tracker's in-place start
+    /// arming that `recordCommandSubmission` then sets, so the reverse order
+    /// silently disarms the agent path. Keep the two calls in this order.
+    var onCommandSubmitted: ((Bool) -> Void)?
+    /// Whether a programmatic payload's content evidence may be carried past
+    /// the submission that consumed it — true only for a raw-mode agent
+    /// foreground, where a bracketed paste can leave it unsubmitted. See
+    /// `preserveProgrammaticCommandInput`.
+    var canCarryCommandInput: (() -> Bool)?
+    /// Whether a key event matching a passthrough-flagged binding should reach
+    /// the program instead of being claimed as an app shortcut. Injected rather
+    /// than computed here because the decision needs the PANE: a zmx-wrapped
+    /// pane's program runs behind the daemon's pty, not this view's, and this
+    /// view has no back-reference to its pane. See `KeybindPassthrough`.
+    var yieldsToProgram: ((NSEvent) -> Bool)?
+    var onProcessExit: (() -> Void)?
+    var onSplitRequest: ((SplitDirection, SplitPosition) -> Void)?
+    var onZoomRequest: (() -> Void)?
+    var isZoomed: Bool = false
+    var onSearchStart: ((String?) -> Void)?
+    var onSearchEnd: (() -> Void)?
+    var onSearchTotal: ((Int?) -> Void)?
+    var onSearchSelected: ((Int?) -> Void)?
+    var onDesktopNotification: ((String, String) -> Void)?
+    var onCommandFinished: ((Int16, UInt64) -> Void)?
+    var onProgressStarted: (() -> Void)?
+    var onProgressFinished: (() -> Void)?
+    var onTerminalRender: (() -> Void)?
+    var onBackgroundColorChange: ((NSColor) -> Void)?
+    var onAdaptiveBackgroundChange: ((NSColor?) -> Void)?
+    /// libghostty pushes scrollback geometry (all values in rows) whenever the
+    /// viewport, scrollback size, or visible row count changes.
+    /// `(total, offset, len)`: total rows including scrollback, the first
+    /// visible row (0 = top of history), and the visible row count.
+    var onScrollbarUpdate: ((UInt64, UInt64, UInt64) -> Void)?
+    /// Fires on each throttled `OUTPUT_ACTIVITY` heartbeat with the surface's
+    /// current total row count. Occlusion-independent — see
+    /// `surfaceDidOutputActivity`.
+    var onOutputActivity: ((UInt64) -> Void)?
+    /// Gives the hosting `SurfaceScrollView` first chance to handle scrollback
+    /// wheel/trackpad events with its iTerm-style line accumulator. It declines
+    /// when there's no scrollback to move through (so alternate-screen apps
+    /// like less/vim fall through to libghostty for mouse reporting). Return
+    /// false to let libghostty handle the event directly.
+    var onScrollWheel: ((NSEvent) -> Bool)?
+    /// The link URL under the mouse (`GHOSTTY_ACTION_MOUSE_OVER_LINK`), nil
+    /// when the pointer leaves it. Drives the pane's hover-URL banner.
+    var onLinkHover: ((String?) -> Void)?
+    /// The pointer cursor libghostty wants over the grid
+    /// (`GHOSTTY_ACTION_MOUSE_SHAPE`) — I-beam over text, a pointing hand
+    /// over links. The hosting `SurfaceScrollView` applies it as its
+    /// `documentCursor`.
+    var onMouseShapeChange: ((NSCursor) -> Void)?
+    /// The `prompt_surface_title` keybind: ask the user for a title. FuturaTerm
+    /// titles live on tabs, so this routes to the tab-rename flow.
+    var onPromptTitle: (() -> Void)?
+    /// The `set_tab_title` keybind: set (or, with nil, clear) the containing
+    /// tab's custom title.
+    var onSetTabTitle: ((String?) -> Void)?
+    /// The pane's current display title, for `copy_title_to_clipboard`. The
+    /// title is pane-derived state (program title / process name), so the
+    /// pane supplies it.
+    var titleProvider: (() -> String?)?
+    /// Last `displayTitle` pushed from `TerminalSurface.configure`, used when
+    /// `titleProvider` has not been wired yet.
+    var accessibilityTitleOverride: String?
+    var isFocused: Bool = false
+
+    func presentAdaptivePaneBackground(_ color: NSColor?) {
+        onAdaptiveBackgroundChange?(color)
+    }
+
+    var currentPwd: String?
+
+    /// True while libghostty reports the surface is at a password prompt
+    /// (surface-target `GHOSTTY_ACTION_SECURE_INPUT`). Registers this view
+    /// with the `SecureInput` manager so keystrokes are shielded from event
+    /// taps exactly while the prompt is focused.
+    var passwordInput: Bool = false {
+        didSet {
+            guard passwordInput != oldValue else { return }
+            let id = ObjectIdentifier(self)
+            if passwordInput {
+                SecureInput.shared.setScoped(id, focused: hasKeyboardFocus)
+            } else {
+                SecureInput.shared.removeScoped(id)
+            }
+        }
+    }
+
+    private var hasKeyboardFocus: Bool {
+        window?.firstResponder === self
+    }
+
+    private var lastScrollbarSnapshot: ScrollbarSnapshot?
+    private var commandSubmissionEvidence = TerminalCommandSubmission.Evidence()
+    private var commandSubmissionEvidenceReset: DispatchWorkItem?
+
+    /// The most recent `GHOSTTY_ACTION_SCROLLBAR` values (`total`/`offset`/`len`
+    /// rows), or nil before the first scrollbar update. Read-only introspection
+    /// for the control CLI's `pane inspect`; the same values drive the overlay
+    /// scrollbar. See #112 — the scrollback `total` was the whole diagnostic.
+    var scrollbarSnapshot: ScrollbarSnapshot? { lastScrollbarSnapshot }
+
+    struct ScrollbarSnapshot: Equatable {
+        let total: UInt64
+        let offset: UInt64
+        let len: UInt64
+    }
+
+    private var _markedRange: NSRange = .init(location: NSNotFound, length: 0)
+    private var accessibilityScreenContentsCache: (
+        contents: String,
+        expiresAt: ContinuousClock.Instant
+    )?
+    /// Last dump `refreshAccessibilityCacheIfNeeded` accepted, kept across TTL
+    /// expiry so a heartbeat with unchanged text reuses AX children.
+    private var lastAccessibilityViewport: String?
+    private var accessibilityCachedChoices: [NumberedChoice] = []
+    private var accessibilityChoiceChildrenCache: [NumberedChoiceAXElement] = []
+    /// Viewport dump substitution so tests can build numbered-choice AX
+    /// children without a live surface. Production leaves this nil.
+    var accessibilityViewportOverride: String?
+    /// Replaces `sendText`/`sendKey` inside `activateNumberedChoice` so tests
+    /// can prove digit + Return without libghostty.
+    var numberedChoiceActivationHandler: ((String, UInt16, NSEvent.ModifierFlags) -> Bool)?
+    private var keyTextAccumulator: [String] = []
+    private var currentKeyEvent: NSEvent?
+
+    init(
+        paneID: UUID,
+        workingDirectory: String,
+        sessionName: String,
+        command: String? = nil,
+        shell: String? = nil,
+        env: [String: String]? = nil,
+        remoteSpec: ProjectPath? = nil,
+        remoteZmxPath: String? = nil
+    ) {
+        self.paneID = paneID
+        self.workingDirectory = workingDirectory
+        self.sessionName = sessionName
+        self.command = command
+        self.shell = shell
+        self.env = env
+        self.remoteSpec = remoteSpec
+        self.remoteZmxPath = remoteZmxPath
+        super.init(frame: .zero)
+        setupTrackingArea()
+        registerForDraggedTypes(Array(Self.dropTypes))
+        Self.liveViews.add(self)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    // MARK: - Surface lifecycle
+
+    private var pendingSurfaceCreation = false
+
+    /// Once destroySurface() has been called this view is "retired": it should
+    /// never spontaneously recreate a surface (e.g. from viewDidMoveToWindow or
+    /// from a stray updateNSView during SwiftUI teardown).
+    private var isDestroyed = false
+
+    func createSurface() {
+        guard !isDestroyed else { return }
+        guard surface == nil, let app = GhosttyApp.shared.app else { return }
+        let backingSize = convertToBacking(bounds).size
+        guard backingSize.width > 0, backingSize.height > 0 else {
+            pendingSurfaceCreation = true
+            return
+        }
+        pendingSurfaceCreation = false
+
+        var config = ghostty_surface_config_new()
+        config.platform_tag = GHOSTTY_PLATFORM_MACOS
+        config.platform = ghostty_platform_u(macos: ghostty_platform_macos_s(nsview: Unmanaged.passUnretained(self).toOpaque()))
+        config.userdata = Unmanaged.passUnretained(self).toOpaque()
+        config.scale_factor = Double(NSScreen.main?.backingScaleFactor ?? 2.0)
+        config.context = GHOSTTY_SURFACE_CONTEXT_SPLIT
+
+        // Every `const char*` field and the env-var array must stay valid for
+        // libghostty. `working_directory`/`command` are consumed during spawn,
+        // but `initial_input` is written to the pty asynchronously (on a later
+        // surface tick, after the child process is up — see the Ghostty config
+        // reference: "written to the pty before any other input"). So these
+        // buffers must outlive `ghostty_surface_new`, not just the call itself.
+        // We `strdup` into heap buffers whose addresses are stable (unlike
+        // pointers into a Swift Array, which move when the array grows) and
+        // retain them on the instance until `destroySurface` frees them.
+        configCStrings.forEach { free($0) }
+        configCStrings = []
+        func cString(_ s: String) -> UnsafePointer<CChar>? {
+            guard let p = strdup(s) else { return nil }
+            configCStrings.append(p)
+            return UnsafePointer(p)
+        }
+
+        if let remoteSpec {
+            // Remote pane (#104): the surface command IS the ssh client —
+            // `ssh -t host 'cd dir && exec zmx attach <name>'`. Persistence
+            // lives in the remote daemon; the local process is disposable, so
+            // no zmx wrapper, no ZMX_DIR pin, no local working directory
+            // (ghostty defaults to home; the cd happens on the remote). The
+            // declared `shell:` doesn't apply either — the remote session
+            // spawns the remote user's login shell. Interactive auth works
+            // because there's no BatchMode: prompts render in the pane, and
+            // any connect failure surfaces on ghostty's abnormal-exit screen.
+            if let sshCommand = RemoteSpawn.paneCommand(
+                remote: remoteSpec, sessionName: sessionName, zmxPath: remoteZmxPath
+            ) {
+                config.command = cString(sshCommand)
+            }
+            // Teach the host our terminfo entry, if the user asked for it, so a
+            // later session's `remoteTermPreamble` settles on xterm-ghostty
+            // instead of xterm-256color. Fire-and-forget by design: it must
+            // never delay or fail this spawn, and the script's own COLORTERM
+            // export already guarantees truecolor without it. Gated on the
+            // background-connections toggle like the foreground probe: it is
+            // its own ssh connection, so on a biometric-gated key it would
+            // raise a second Touch ID dialog beside the pane's own (#272).
+            if Preferences.shared.backgroundSSHConnections {
+                RemoteTerminfoInstaller.shared.ensureInstalled(remote: remoteSpec)
+            }
+        } else {
+            // Canonicalize before libghostty sees it: the string is exported
+            // VERBATIM as the shell's $PWD, and a trailing slash there is
+            // fatal under nushell — nu refuses to start ("$env.PWD contains
+            // trailing slashes"), killing the pane in ~150ms on ghostty's
+            // abnormal-exit screen (the chdir itself is fine; only the string
+            // in the env matters). zsh merely blanks its `%c`/`%1~` prompt
+            // segment. This is the last line of defense: it covers panes
+            // restored from snapshots persisted before ProjectStore
+            // normalized on load, and any other path source (layout `cwd:`,
+            // split inheritance). `normalizedForStorage`, not bare
+            // `canonicalLocal`, so a non-local-shaped string passes through
+            // untouched instead of being coerced relative to the app's cwd.
+            config.working_directory = cString(ProjectPath.normalizedForStorage(workingDirectory))
+
+            // Shell binary → the surface's program. nil falls back to libghostty's
+            // own resolution (which honors the user's ghostty config / login shell).
+            if let resolvedShell = shell ?? GhosttyApp.shared.configuredShell {
+                config.command = cString(resolvedShell)
+            }
+        }
+
+        // Wrap the resolved shell in zmx for session persistence (LOCAL panes
+        // only — a remote pane's persistence is the remote daemon's job, and
+        // nesting local zmx around the ssh client is broken upstream). The
+        // `command_wrapper` argv is prepended to ghostty's fully-resolved
+        // command (after login(1) + shell integration), so OSC 7 cwd / OSC 133
+        // framing stay intact — the shell just runs as a child of
+        // `zmx attach <sessionName>`, which upserts the session and re-attaches
+        // the live daemon on relaunch. nil executable (zmx unbundled or over
+        // the socket-path budget) → no wrapper, a plain unpersisted shell.
+        // The argv element buffers come from `cString` (freed in
+        // destroySurface); the pointer array is bound around the spawn below.
+        let wrapperArgv: [UnsafePointer<CChar>?] = remoteSpec != nil ? [] : ZmxAttach.wrapperArgv(
+            executablePath: ZmxClient.live.executableURL()?.path,
+            sessionID: sessionName
+        ).map { cString($0) }
+
+        // Declared `run` is typed into the (wrapped) shell verbatim, as if the
+        // user had entered it at the prompt. No shell-syntax handling: cwd is
+        // set above, not via an injected `cd`.
+        if let command, !command.isEmpty {
+            config.initial_input = cString(command + "\n")
+        }
+
+        // Extra environment variables. The array of key/value structs points at
+        // buffers owned above; hold it in a local that outlives the call.
+        var envVars: [ghostty_env_var_s] = []
+        if let env, !env.isEmpty {
+            for (key, value) in env {
+                envVars.append(ghostty_env_var_s(key: cString(key), value: cString(value)))
+            }
+        }
+        if !wrapperArgv.isEmpty {
+            // Pin the socket dir into the WRAPPED SHELL's env, not just our own
+            // zmx subprocesses: a user's shell rc re-exporting ZMX_DIR/TMPDIR
+            // would otherwise move where a *nested* zmx invocation resolves
+            // sockets, past what the budget probe validated — kill and attach
+            // could then target different dirs. (Same defense Supacode ships.)
+            envVars.append(ghostty_env_var_s(
+                key: cString("ZMX_DIR"),
+                value: cString(ZmxSocketBudget.socketDir())
+            ))
+        }
+
+        /// Sets env on the config and spawns. Split out so the optional
+        /// command-wrapper buffer scope (below) wraps both env-present and
+        /// env-absent paths without four-way nesting.
+        func makeSurface() {
+            if envVars.isEmpty {
+                surface = ghostty_surface_new(app, &config)
+            } else {
+                envVars.withUnsafeMutableBufferPointer { buf in
+                    config.env_vars = buf.baseAddress
+                    config.env_var_count = buf.count
+                    surface = ghostty_surface_new(app, &config)
+                }
+            }
+        }
+
+        // The command_wrapper argv (a `const char* const*`) needs the pointer
+        // array itself to have a stable base for the duration of the spawn;
+        // bind it just around `makeSurface`. Empty wrapper → no zmx (bypass).
+        if wrapperArgv.isEmpty {
+            makeSurface()
+        } else {
+            wrapperArgv.withUnsafeBufferPointer { buf in
+                config.command_wrapper = buf.baseAddress
+                config.command_wrapper_count = buf.count
+                makeSurface()
+            }
+        }
+        guard let surface else { return }
+
+        // A wrapped spawn created (or reattached) a zmx session — the
+        // resolver's name→leader-pid cache needs a refresh to see it. (The
+        // session registers asynchronously, so the first refresh may miss;
+        // AppState retries while a wrapped pane is absent from `zmx ls`.)
+        if !wrapperArgv.isEmpty {
+            isZmxWrapped = true
+            NotificationCenter.default.post(name: .zmxSessionsChanged, object: nil)
+        }
+
+        syncColorScheme()
+
+        if let screen = window?.screen ?? NSScreen.main,
+           let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? UInt32
+        {
+            ghostty_surface_set_display_id(surface, displayID)
+        }
+        ghostty_surface_set_focus(surface, isFocused)
+        syncOcclusion()
+    }
+
+    /// Tell libghostty whether this surface's pixels are actually on screen.
+    /// An occluded surface — an off-screen tab parked in the `SurfaceIncubator`
+    /// window, or a covered/minimized/hidden main window — parks its renderer's
+    /// display link instead of drawing every frame. With many panes that idle
+    /// redraw is the dominant background CPU cost. The pty io thread keeps
+    /// running while occluded, so off-screen output stays current and the tab
+    /// is up to date the moment it's viewed.
+    ///
+    /// The bool is "visible" (matches Ghostty's own `updateOcclusionState`):
+    /// true when the surface's window reports `.visible`, false otherwise —
+    /// including when the view has no window at all.
+    private func syncOcclusion() {
+        guard let surface else { return }
+        let visible = window?.occlusionState.contains(.visible) ?? false
+        ghostty_surface_set_occlusion(surface, visible)
+    }
+
+    func destroySurface() {
+        isDestroyed = true
+        clearCommandSubmissionEvidence()
+        // A composition in flight has nowhere left to commit — drop it before
+        // the surface goes, so a reattached surface starts uncomposed rather
+        // than inheriting a preedit that can never be resolved.
+        discardMarkedText()
+        if let surface { ghostty_surface_free(surface) }
+        surface = nil
+        clearAccessibilityCaches()
+        configCStrings.forEach { free($0) }
+        configCStrings = []
+    }
+
+    /// PID of the foreground process running in this surface's pty (libghostty's
+    /// `tcgetpgrp` on the pty master), or nil if there's no surface. When the
+    /// user is idle at a shell prompt this is the shell itself; while a command
+    /// runs it's that command. Used by `ProcessInspector` to capture a pane's
+    /// running command for `saveLayout`.
+    var foregroundPID: pid_t? {
+        guard let surface else { return nil }
+        let pid = ghostty_surface_foreground_pid(surface)
+        return pid != 0 ? pid_t(pid) : nil
+    }
+
+    /// The slave tty path for this surface's pty, used by `ProcessInspector` to
+    /// read terminal input mode (canonical shell command vs raw/cbreak TUI).
+    var ttyName: String? {
+        guard let surface else { return nil }
+        let tty = ghostty_surface_tty_name(surface)
+        defer { ghostty_string_free(tty) }
+        guard let ptr = tty.ptr, tty.len > 0 else { return nil }
+        let bytes = UnsafeBufferPointer(start: ptr, count: Int(tty.len)).map { UInt8(bitPattern: $0) }
+        guard let name = String(bytes: bytes, encoding: .utf8), !name.isEmpty else { return nil }
+        return name
+    }
+
+    deinit {
+        if let surface { ghostty_surface_free(surface) }
+        configCStrings.forEach { free($0) }
+        for token in windowObservers {
+            NotificationCenter.default.removeObserver(token)
+        }
+    }
+
+    nonisolated(unsafe) private var windowObservers: [NSObjectProtocol] = []
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // Tear down previous window's observers.
+        for token in windowObservers {
+            NotificationCenter.default.removeObserver(token)
+        }
+        windowObservers.removeAll()
+
+        guard let window else {
+            // Detached from its window (e.g. pulled out of the incubator before
+            // re-attaching). Mark occluded so the renderer doesn't draw to an
+            // off-screen layer.
+            syncOcclusion()
+            return
+        }
+        if surface == nil {
+            createSurface()
+        } else {
+            // Reconnect existing surface to the new window
+            let scale = Double(window.backingScaleFactor)
+            ghostty_surface_set_content_scale(surface, scale, scale)
+            let size = convertToBacking(bounds).size
+            if size.width > 0, size.height > 0 {
+                ghostty_surface_set_size(surface, UInt32(size.width), UInt32(size.height))
+            }
+            ghostty_surface_set_focus(surface, isFocused)
+        }
+        updateMetalLayerSize()
+
+        // The per-view `viewDidChangeBackingProperties` override doesn't reliably
+        // fire when the window moves between displays of different DPI. Listen
+        // on the window directly so the surface picks up the new scale even
+        // when AppKit doesn't propagate the call to every layer-backed subview.
+        let handler: @Sendable (Notification) -> Void = { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateMetalLayerSize() }
+        }
+        let backing = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeBackingPropertiesNotification,
+            object: window,
+            queue: .main,
+            using: handler
+        )
+        let screen = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeScreenNotification,
+            object: window,
+            queue: .main,
+            using: handler
+        )
+        // Park the renderer when this view's window is covered, minimized, or
+        // hidden; resume when it's revealed. The incubator window never reports
+        // `.visible`, so off-screen tabs stay occluded for free.
+        let occlusion = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.syncOcclusion() }
+        }
+        windowObservers = [backing, screen, occlusion]
+        syncOcclusion()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        if pendingSurfaceCreation { createSurface() }
+        updateMetalLayerSize()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        updateMetalLayerSize()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        syncColorScheme()
+    }
+
+    /// Push the split-resolution scheme into libghostty — keyed off the
+    /// tracked system scheme, never this view's `effectiveAppearance`, which
+    /// our own preferredColorScheme pins (issue #144).
+    func syncColorScheme() {
+        guard let surface else { return }
+        let isDark = GhosttyApp.shared.systemScheme == .dark
+        ghostty_surface_set_color_scheme(surface, isDark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
+    }
+
+    private func updateMetalLayerSize() {
+        guard let surface, window != nil else { return }
+        let scaledSize = convertToBacking(bounds).size
+        guard scaledSize.width > 0, scaledSize.height > 0 else { return }
+        let scale = Double(window?.backingScaleFactor ?? 2.0)
+        if let liveLayer = layer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            liveLayer.contentsScale = CGFloat(scale)
+            CATransaction.commit()
+        }
+        ghostty_surface_set_content_scale(surface, scale, scale)
+        ghostty_surface_set_size(surface, UInt32(scaledSize.width), UInt32(scaledSize.height))
+    }
+
+    // MARK: - App shortcut detection
+
+    /// System shortcuts that should always pass through to macOS.
+    private static let systemKeys: Set<String> = ["q", "h", "m", ","]
+
+    private func isAppShortcut(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let key = (event.charactersIgnoringModifiers ?? "").lowercased()
+        // Always let system Cmd shortcuts through
+        if flags == .command, Self.systemKeys.contains(key) { return true }
+        // Cmd+1-9 for tab selection
+        if flags == .command, let n = Int(key), (1 ... 9).contains(n) { return true }
+        // A binding the user flagged for passthrough is NOT an app shortcut
+        // while a program owns this pane's keyboard — otherwise the key would
+        // die here even though the responder deliberately let it fall through.
+        // The two paths must agree; they read the same policy microseconds
+        // apart, off the same live tty state.
+        if yieldsToProgram?(event) == true { return false }
+        // Check all configurable hotkey actions
+        if HotkeyAction.allCases.contains(where: { HotkeyRegistry.matches(event, action: $0) }) { return true }
+        return false
+    }
+
+    func needsConfirmQuit() -> Bool {
+        guard let surface else { return false }
+        return ghostty_surface_needs_confirm_quit(surface)
+    }
+
+    /// Cell height in points (not backing pixels). libghostty reports cell
+    /// dimensions in backing pixels; divide by the backing scale so callers
+    /// working in AppKit's point space (e.g. the scroll view's document view)
+    /// get the right value. Returns 0 if the surface isn't ready.
+    var cellHeightPoints: CGFloat {
+        guard let surface else { return 0 }
+        let size = ghostty_surface_size(surface)
+        guard size.cell_height_px > 0 else { return 0 }
+        let scale = window?.backingScaleFactor ?? 2.0
+        return CGFloat(size.cell_height_px) / scale
+    }
+
+    func notifySurfaceFocused() {
+        guard let surface else { return }
+        ghostty_surface_set_focus(surface, true)
+    }
+
+    func notifySurfaceUnfocused() {
+        guard let surface else { return }
+        ghostty_surface_set_focus(surface, false)
+    }
+
+    // MARK: - First responder
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func becomeFirstResponder() -> Bool {
+        let result = super.becomeFirstResponder()
+        if result, let surface {
+            ghostty_surface_set_focus(surface, true)
+            onFocus?()
+        }
+        if result { syncSecureInputFocus(true) }
+        return result
+    }
+
+    override func resignFirstResponder() -> Bool {
+        // Before super, while `inputContext` still resolves to ours. Focus
+        // moves off a pane constantly (tab switch, split focus, palette), and
+        // any of those landing mid-composition would otherwise strand
+        // `_markedRange` and kill plain-key input in this pane for good.
+        discardMarkedText()
+        let result = super.resignFirstResponder()
+        if result, let surface { ghostty_surface_set_focus(surface, false) }
+        if result { syncSecureInputFocus(false) }
+        return result
+    }
+
+    /// Secure input for a password prompt applies only while this view holds
+    /// keyboard focus — a prompt sitting in a background pane must not shield
+    /// (and so break) typing that's going elsewhere.
+    private func syncSecureInputFocus(_ focused: Bool) {
+        guard passwordInput else { return }
+        SecureInput.shared.setScoped(ObjectIdentifier(self), focused: focused)
+    }
+
+    // MARK: - Tracking area
+
+    private var currentTrackingArea: NSTrackingArea?
+
+    private func setupTrackingArea() {
+        if let existing = currentTrackingArea { removeTrackingArea(existing) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self
+        )
+        addTrackingArea(area)
+        currentTrackingArea = area
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        setupTrackingArea()
+    }
+
+    // MARK: - Keyboard
+
+    private func recordCommandInput(_ text: String) {
+        commandSubmissionEvidenceReset?.cancel()
+        commandSubmissionEvidenceReset = nil
+        commandSubmissionEvidence.recordText(text)
+    }
+
+    private func consumeCommandSubmissionEvidence() -> Bool {
+        commandSubmissionEvidenceReset?.cancel()
+        commandSubmissionEvidenceReset = nil
+        return commandSubmissionEvidence.consume()
+    }
+
+    private func clearCommandSubmissionEvidence() {
+        commandSubmissionEvidenceReset?.cancel()
+        commandSubmissionEvidenceReset = nil
+        commandSubmissionEvidence.clear()
+    }
+
+    /// `sendText` may contain a newline that executes directly, or it may be
+    /// bracketed-pasted into a raw TUI and need a following encoded Return.
+    /// Preserve its content briefly for the latter without leaving stale
+    /// evidence behind indefinitely in the former.
+    ///
+    /// Gated on `canCarryCommandInput`, because the two cases are
+    /// indistinguishable from here and the evidence only ORs in — never clears
+    /// — so an unconditional carry makes a genuinely blank Return arriving
+    /// inside the window report content it doesn't have (a `pane run "…"`
+    /// immediately followed by a bare newline is enough). The carry is only
+    /// *needed* where a bracketed paste can swallow the newline, which is the
+    /// same agent-TUI foreground the in-place heuristic requires, so scoping it
+    /// there keeps the ambiguous window out of the ordinary shell case.
+    private func preserveProgrammaticCommandInput(_ text: String) {
+        guard canCarryCommandInput?() ?? false else { return }
+        commandSubmissionEvidence.recordText(text)
+        let reset = DispatchWorkItem { [weak self] in
+            self?.commandSubmissionEvidence.clear()
+            self?.commandSubmissionEvidenceReset = nil
+        }
+        commandSubmissionEvidenceReset = reset
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: reset)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        onInteraction?()
+        guard let surface else { super.keyDown(with: event)
+            return
+        }
+        let action: ghostty_input_action_e = event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if TerminalCommandSubmission.clearsInputEvidence(
+            keyCode: event.keyCode,
+            hasControl: flags.contains(.control),
+            hasCommand: flags.contains(.command)
+        ) {
+            clearCommandSubmissionEvidence()
+        }
+
+        if flags.contains(.control), !flags.contains(.command), !flags.contains(.option), !hasMarkedText() {
+            if isAppShortcut(event) { return }
+            // Swallow *unshifted* Ctrl-\ (the tty VQUIT char, 0x1C → SIGQUIT).
+            // It's trivially easy to hit by accident and kills the pane's
+            // foreground process with a core dump; forwarding it to ghostty is
+            // almost never what the user meant. Match by hardware keyCode (42 =
+            // "\") so it's layout-independent. Shift matters: verified that
+            // libghostty encodes Ctrl-\ as the quit byte but does NOT for
+            // Ctrl-Shift-\, so guarding the shifted chord would eat a harmless
+            // keystroke — leave it alone. SIGQUIT stays reachable via `kill
+            // -QUIT` for the rare intentional case.
+            if event.keyCode == 42, !flags.contains(.shift) { return }
+            var ke = buildKeyEvent(from: event, action: action)
+            let text = event.charactersIgnoringModifiers ?? event.characters ?? ""
+            if text.isEmpty {
+                ke.text = nil
+                _ = ghostty_surface_key(surface, ke)
+            } else {
+                text.withCString { ke.text = $0
+                    _ = ghostty_surface_key(surface, ke)
+                }
+            }
+            return
+        }
+
+        if flags.contains(.command) {
+            if isAppShortcut(event) { return }
+            var ke = buildKeyEvent(from: event, action: action)
+            ke.text = nil
+            _ = ghostty_surface_key(surface, ke)
+            return
+        }
+
+        let hadMarkedText = hasMarkedText()
+        currentKeyEvent = event
+        keyTextAccumulator = []
+        // Ask libghostty which modifier flags to use for *translation* — when
+        // macos-option-as-alt is on, it returns flags with Option stripped.
+        // We then build a synthetic NSEvent whose `characters` come from
+        // `characters(byApplyingModifiers:)` with those flags, so Option+b
+        // yields "b" instead of "∫" when routed through interpretKeyEvents.
+        let translationEvent = translatedEvent(for: event)
+        interpretKeyEvents([translationEvent])
+        currentKeyEvent = nil
+
+        var ke = buildKeyEvent(from: event, action: action)
+        // consumed_mods tells libghostty which modifiers were "used up" to
+        // produce the translated text. We use the translation event's flags
+        // (Alt stripped when option-as-alt is on), minus ctrl/command which
+        // never contribute to text translation. This matches Ghostty's own
+        // app: with option-as-alt on, Alt is *not* consumed, so libghostty
+        // encodes ESC+b for Option+b, letting editors like Helix see it.
+        ke.consumed_mods = consumedMods(translationEvent.modifierFlags)
+        ke.composing = hasMarkedText() || hadMarkedText
+
+        // Accumulator content is text the IME *committed* via `insertText`
+        // during interpretKeyEvents. Send it regardless of `composing` state:
+        // committing happens precisely when the IME finishes a syllable, which
+        // may overlap with a new composition starting (so `composing == true`
+        // here even though this specific text is finalized). Without this,
+        // Korean / Japanese / Chinese input drops every committed character.
+        // The text itself carries no composing flag since it's already final.
+        var forwarded = false
+        if !keyTextAccumulator.isEmpty {
+            var commitKE = ke
+            commitKE.composing = false
+            for text in keyTextAccumulator {
+                text.withCString { commitKE.text = $0
+                    _ = ghostty_surface_key(surface, commitKE)
+                }
+                if TerminalCommandSubmission.shouldRecordLiteralText(hasOption: flags.contains(.option)) {
+                    recordCommandInput(text)
+                }
+                forwarded = true
+            }
+        } else if !hasMarkedText() {
+            let text = filterSpecial(event.characters ?? "")
+            if !text.isEmpty, !ke.composing {
+                text.withCString { ke.text = $0
+                    _ = ghostty_surface_key(surface, ke)
+                }
+                if TerminalCommandSubmission.shouldRecordLiteralText(hasOption: flags.contains(.option)) {
+                    recordCommandInput(text)
+                }
+            } else {
+                ke.consumed_mods = GHOSTTY_MODS_NONE
+                ke.text = nil
+                _ = ghostty_surface_key(surface, ke)
+            }
+            forwarded = true
+        }
+
+        let userModifiers: NSEvent.ModifierFlags = [.shift, .control, .option, .command]
+        if forwarded,
+           TerminalCommandSubmission.isReturn(
+               keyCode: event.keyCode,
+               isRepeat: event.isARepeat,
+               hasMarkedText: hadMarkedText || hasMarkedText(),
+               hasUserModifiers: !flags.isDisjoint(with: userModifiers)
+           )
+        {
+            onCommandSubmitted?(consumeCommandSubmissionEvidence())
+        }
+    }
+
+    override func doCommand(by selector: Selector) {}
+
+    override func insertText(_ insertString: Any) {
+        insertText(insertString, replacementRange: NSRange(location: NSNotFound, length: 0))
+    }
+
+    override func keyUp(with event: NSEvent) {
+        guard let surface else { return }
+        var ke = buildKeyEvent(from: event, action: GHOSTTY_ACTION_RELEASE)
+        ke.text = nil
+        _ = ghostty_surface_key(surface, ke)
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        onInteraction?()
+        guard let surface else { return }
+        var ke = buildKeyEvent(from: event, action: isFlagPress(event) ? GHOSTTY_ACTION_PRESS : GHOSTTY_ACTION_RELEASE)
+        ke.text = nil
+        _ = ghostty_surface_key(surface, ke)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if isAppShortcut(event) { return false }
+        // Confirm this view owns keyboard focus BEFORE firing the interaction
+        // side effect: AppKit offers key equivalents to the whole hierarchy, so
+        // every visible pane in a split receives this. Running `onInteraction`
+        // before the guard cleared "needs attention" on untouched panes and
+        // posted a poll event per pane per keypress.
+        guard window?.firstResponder === self || window?.firstResponder === inputContext else { return false }
+        onInteraction?()
+        guard event.type == .keyDown, let surface else { return false }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.command) || flags.contains(.control) || flags.contains(.option) else { return false }
+        if TerminalCommandSubmission.clearsInputEvidence(
+            keyCode: event.keyCode,
+            hasControl: flags.contains(.control),
+            hasCommand: flags.contains(.command)
+        ) {
+            clearCommandSubmissionEvidence()
+        }
+        var ke = buildKeyEvent(from: event, action: event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS)
+        ke.text = nil
+        if ghostty_surface_key_is_binding(surface, ke, nil) {
+            _ = ghostty_surface_key(surface, ke)
+            return true
+        }
+        return false
+    }
+
+    // MARK: - Mouse
+
+    private func mousePoint(from event: NSEvent) -> NSPoint {
+        let local = convert(event.locationInWindow, from: nil)
+        return NSPoint(x: local.x, y: bounds.height - local.y)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onInteraction?()
+        guard let surface else { return }
+        window?.makeFirstResponder(self)
+        ghostty_surface_set_focus(surface, true)
+        onFocus?()
+        let pt = mousePoint(from: event)
+        ghostty_surface_mouse_pos(surface, pt.x, pt.y, mods(event))
+        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, mods(event))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let surface else { return }
+        let pt = mousePoint(from: event)
+        ghostty_surface_mouse_pos(surface, pt.x, pt.y, mods(event))
+        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, mods(event))
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        mouseMoved(with: event)
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        mouseMoved(with: event)
+    }
+
+    override func otherMouseDragged(with event: NSEvent) {
+        mouseMoved(with: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard let surface else { return }
+        let pt = mousePoint(from: event)
+        ghostty_surface_mouse_pos(surface, pt.x, pt.y, mods(event))
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        onInteraction?()
+        guard let surface else { return }
+        let pt = mousePoint(from: event)
+        ghostty_surface_mouse_pos(surface, pt.x, pt.y, mods(event))
+        if !ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_RIGHT, mods(event)) {
+            presentContextMenu(with: event)
+        }
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        guard let surface else { return }
+        let pt = mousePoint(from: event)
+        ghostty_surface_mouse_pos(surface, pt.x, pt.y, mods(event))
+        if !ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_RIGHT, mods(event)) {
+            super.rightMouseUp(with: event)
+        }
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        onInteraction?()
+        guard let surface else { return }
+        _ = ghostty_surface_mouse_button(
+            surface,
+            GHOSTTY_MOUSE_PRESS,
+            Self.mouseButton(fromNSEventButtonNumber: event.buttonNumber),
+            mods(event)
+        )
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        guard let surface else { return }
+        _ = ghostty_surface_mouse_button(
+            surface,
+            GHOSTTY_MOUSE_RELEASE,
+            Self.mouseButton(fromNSEventButtonNumber: event.buttonNumber),
+            mods(event)
+        )
+    }
+
+    /// NSEvent.buttonNumber → libghostty button, mirroring the Ghostty mac
+    /// app's mapping: 0=left, 1=right, 2=middle, 3=back (button 8),
+    /// 4=forward (button 9), then the remaining extra buttons.
+    static func mouseButton(fromNSEventButtonNumber buttonNumber: Int) -> ghostty_input_mouse_button_e {
+        switch buttonNumber {
+        case 0: GHOSTTY_MOUSE_LEFT
+        case 1: GHOSTTY_MOUSE_RIGHT
+        case 2: GHOSTTY_MOUSE_MIDDLE
+        case 3: GHOSTTY_MOUSE_EIGHT
+        case 4: GHOSTTY_MOUSE_NINE
+        case 5: GHOSTTY_MOUSE_SIX
+        case 6: GHOSTTY_MOUSE_SEVEN
+        case 7: GHOSTTY_MOUSE_FOUR
+        case 8: GHOSTTY_MOUSE_FIVE
+        case 9: GHOSTTY_MOUSE_TEN
+        case 10: GHOSTTY_MOUSE_ELEVEN
+        default: GHOSTTY_MOUSE_UNKNOWN
+        }
+    }
+
+    // MARK: - Programmatic selection
+
+    /// UTF-16 `range` in the visible viewport (`readText(scrollback: false)`).
+    /// Empty range is a center click-to-clear; non-empty drags the leading
+    /// edge of the start cell to the trailing edge of the end cell (a 1-cell
+    /// range still highlights that character). True means those mouse events
+    /// were sent, not that `read_selection` has been observed.
+    @discardableResult
+    func selectText(range: NSRange) -> Bool {
+        guard surface != nil else { return false }
+        guard let text = readText(scrollback: false),
+              let mapped = TerminalSelectionMapping.cells(for: range, in: text)
+        else { return false }
+        if range.length == 0 {
+            return clickCell(col: mapped.start.col, row: mapped.start.row)
+        }
+        return selectCells(start: mapped.start, end: mapped.end)
+    }
+
+    /// 1-based viewport cells. Out of range or no surface returns false
+    /// without sending mouse events. Same-cell still drags leading→trailing
+    /// so one character can be selected. True means events were sent.
+    @discardableResult
+    func selectCells(start: (col: Int, row: Int), end: (col: Int, row: Int)) -> Bool {
+        sendMouseDrag(from: start, to: end, kind: .select)
+    }
+
+    /// Press and release the left button at the center of a 1-based viewport cell.
+    @discardableResult
+    func clickCell(col: Int, row: Int) -> Bool {
+        sendMouseDrag(from: (col, row), to: (col, row), kind: .click)
+    }
+
+    /// Left-button press, move, release — the same `ghostty_surface_mouse_pos`
+    /// / `_button` path as `mouseDown`/`mouseUp`.
+    @discardableResult
+    private func sendMouseDrag(
+        from start: (col: Int, row: Int),
+        to end: (col: Int, row: Int),
+        kind: TerminalSelectionMapping.DragKind
+    ) -> Bool {
+        guard let surface, let size = surfaceSize else { return false }
+        let scale = window?.backingScaleFactor ?? 2.0
+        let cellWidth = CGFloat(size.cell_width_px) / scale
+        let cellHeight = CGFloat(size.cell_height_px) / scale
+        guard let points = TerminalSelectionMapping.dragPoints(
+            from: start,
+            to: end,
+            grid: (Int(size.columns), Int(size.rows)),
+            cellSize: (cellWidth, cellHeight),
+            kind: kind
+        )
+        else { return false }
+        onInteraction?()
+        window?.makeFirstResponder(self)
+        ghostty_surface_set_focus(surface, true)
+        onFocus?()
+        let mods = GHOSTTY_MODS_NONE
+        ghostty_surface_mouse_pos(surface, points.start.x, points.start.y, mods)
+        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, mods)
+        ghostty_surface_mouse_pos(surface, points.end.x, points.end.y, mods)
+        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, mods)
+        accessibilityScreenContentsCache = nil
+        return true
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        onInteraction?()
+        guard let surface else { return }
+
+        var x = event.scrollingDeltaX
+        var y = event.scrollingDeltaY
+        if event.hasPreciseScrollingDeltas {
+            // Match Ghostty's macOS frontend: precise trackpad/Magic Mouse
+            // deltas are valid but feel slow at 1x because terminals scroll in
+            // rows instead of continuous document pixels.
+            x *= 2
+            y *= 2
+        }
+
+        if !ghostty_surface_mouse_captured(surface), onScrollWheel?(event) == true {
+            return
+        }
+
+        ghostty_surface_mouse_scroll(surface, x, y, scrollMods(for: event))
+    }
+
+    private func scrollMods(for event: NSEvent) -> ghostty_input_scroll_mods_t {
+        var scrollMods: ghostty_input_scroll_mods_t = 0
+        if event.hasPreciseScrollingDeltas { scrollMods |= 1 }
+        scrollMods |= scrollMomentum(for: event.momentumPhase) << 1
+        return scrollMods
+    }
+
+    private func scrollMomentum(for phase: NSEvent.Phase) -> ghostty_input_scroll_mods_t {
+        switch phase {
+        case .began: 1
+        case .stationary: 2
+        case .changed: 3
+        case .ended: 4
+        case .cancelled: 5
+        case .mayBegin: 6
+        default: 0
+        }
+    }
+
+    // MARK: - Context menu
+
+    private func presentContextMenu(with event: NSEvent) {
+        let menu = NSMenu(title: "Terminal")
+        let paste = NSMenuItem(title: "Paste", action: #selector(handlePaste), keyEquivalent: "")
+        paste.target = self
+        paste.isEnabled = GhosttyCallbacks.hasPasteboardContent()
+        menu.addItem(paste)
+        menu.addItem(.separator())
+        addSplitItem(menu, "Split Right", .horizontal, .second)
+        addSplitItem(menu, "Split Left", .horizontal, .first)
+        addSplitItem(menu, "Split Down", .vertical, .second)
+        addSplitItem(menu, "Split Up", .vertical, .first)
+        if onZoomRequest != nil {
+            menu.addItem(.separator())
+            let zoom = NSMenuItem(
+                title: isZoomed ? "Restore Pane" : "Zoom Pane",
+                action: #selector(handleZoom),
+                keyEquivalent: ""
+            )
+            zoom.target = self
+            menu.addItem(zoom)
+        }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    @objc
+    private func handleZoom() {
+        onZoomRequest?()
+    }
+
+    private func addSplitItem(_ menu: NSMenu, _ title: String, _ dir: SplitDirection, _ pos: SplitPosition) {
+        let item = NSMenuItem(title: title, action: #selector(handleSplit(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = ContextSplit(direction: dir, position: pos)
+        menu.addItem(item)
+    }
+
+    @objc
+    private func handlePaste() {
+        onInteraction?()
+        guard let text = GhosttyCallbacks.readPasteboardText() else { return }
+        window?.makeFirstResponder(self)
+        insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
+    }
+
+    @objc
+    private func handleSplit(_ sender: NSMenuItem) {
+        guard let split = sender.representedObject as? ContextSplit else { return }
+        onSplitRequest?(split.direction, split.position)
+    }
+
+    private final class ContextSplit: NSObject {
+        let direction: SplitDirection
+        let position: SplitPosition
+        init(direction: SplitDirection, position: SplitPosition) {
+            self.direction = direction
+            self.position = position
+        }
+    }
+
+    // MARK: - Search
+
+    func sendSearchQuery(_ needle: String) {
+        guard let surface else { return }
+        let action = "search:\(needle)"
+        ghostty_surface_binding_action(surface, action, UInt(action.utf8.count))
+    }
+
+    func navigateSearch(direction: SearchDirection) {
+        guard let surface else { return }
+        let action = "navigate_search:\(direction.rawValue)"
+        ghostty_surface_binding_action(surface, action, UInt(action.utf8.count))
+    }
+
+    func endSearch() {
+        guard let surface else { return }
+        let action = "end_search"
+        ghostty_surface_binding_action(surface, action, UInt(action.utf8.count))
+    }
+
+    func startSearch() {
+        guard let surface else { return }
+        let action = "start_search"
+        ghostty_surface_binding_action(surface, action, UInt(action.utf8.count))
+    }
+
+    enum SearchDirection: String { case next, previous }
+
+    // MARK: - Key event helpers
+
+    private func buildKeyEvent(from event: NSEvent, action: ghostty_input_action_e) -> ghostty_input_key_s {
+        var ke = ghostty_input_key_s()
+        ke.action = action
+        ke.keycode = UInt32(event.keyCode)
+        ke.mods = mods(event)
+        ke.consumed_mods = GHOSTTY_MODS_NONE
+        ke.composing = false
+        ke.text = nil
+        ke.unshifted_codepoint = unshiftedCodepoint(from: event)
+        return ke
+    }
+
+    private func consumedMods(_ flags: NSEvent.ModifierFlags) -> ghostty_input_mods_e {
+        // ctrl/command never contribute to text translation; assume everything
+        // else did. Matches Ghostty's own app behavior.
+        var m = GHOSTTY_MODS_NONE.rawValue
+        if flags.contains(.shift) { m |= GHOSTTY_MODS_SHIFT.rawValue }
+        if flags.contains(.option) { m |= GHOSTTY_MODS_ALT.rawValue }
+        if flags.contains(.capsLock) { m |= GHOSTTY_MODS_CAPS.rawValue }
+        return ghostty_input_mods_e(rawValue: m)
+    }
+
+    private func mods(_ event: NSEvent) -> ghostty_input_mods_e {
+        var m = GHOSTTY_MODS_NONE.rawValue
+        let f = event.modifierFlags
+        if f.contains(.shift) { m |= GHOSTTY_MODS_SHIFT.rawValue }
+        if f.contains(.control) { m |= GHOSTTY_MODS_CTRL.rawValue }
+        if f.contains(.option) { m |= GHOSTTY_MODS_ALT.rawValue }
+        if f.contains(.command) { m |= GHOSTTY_MODS_SUPER.rawValue }
+        if f.contains(.capsLock) { m |= GHOSTTY_MODS_CAPS.rawValue }
+        // Side bits: NSEvent's modifierFlags include device-dependent bits
+        // (NX_DEVICE{L,R}*KEYMASK) that tell us which physical modifier key was
+        // pressed. libghostty needs the side bit to honor macos-option-as-alt =
+        // left/right (and the equivalent shift/ctrl/super distinctions). The
+        // SIDE bit is "1 = right" and is only meaningful when the base mod is
+        // set, so we mark it whenever the right key is down and the left is
+        // not — matching how Ghostty's own macOS app reports sides.
+        let raw = f.rawValue
+        let leftShift: UInt = 0x02, rightShift: UInt = 0x04
+        let leftCtrl: UInt = 0x01, rightCtrl: UInt = 0x2000
+        let leftAlt: UInt = 0x20, rightAlt: UInt = 0x40
+        let leftCmd: UInt = 0x08, rightCmd: UInt = 0x10
+        if raw & rightShift != 0, raw & leftShift == 0 { m |= GHOSTTY_MODS_SHIFT_RIGHT.rawValue }
+        if raw & rightCtrl != 0, raw & leftCtrl == 0 { m |= GHOSTTY_MODS_CTRL_RIGHT.rawValue }
+        if raw & rightAlt != 0, raw & leftAlt == 0 { m |= GHOSTTY_MODS_ALT_RIGHT.rawValue }
+        if raw & rightCmd != 0, raw & leftCmd == 0 { m |= GHOSTTY_MODS_SUPER_RIGHT.rawValue }
+        return ghostty_input_mods_e(rawValue: m)
+    }
+
+    private func isFlagPress(_ event: NSEvent) -> Bool {
+        let f = event.modifierFlags
+        switch event.keyCode {
+        case 56,
+             60: return f.contains(.shift)
+        case 58,
+             61: return f.contains(.option)
+        case 59,
+             62: return f.contains(.control)
+        case 55,
+             54: return f.contains(.command)
+        case 57: return f.contains(.capsLock)
+        default: return false
+        }
+    }
+
+    private func filterSpecial(_ text: String) -> String {
+        guard let scalar = text.unicodeScalars.first else { return "" }
+        let v = scalar.value
+        if v < 0x20 || (0xF700 ... 0xF8FF).contains(v) { return "" }
+        return text
+    }
+
+    /// Builds a synthetic NSEvent whose modifier flags reflect libghostty's
+    /// translation policy — with macos-option-as-alt on, Option is stripped so
+    /// `characters(byApplyingModifiers:)` returns the unshifted char ("b")
+    /// instead of the macOS special char ("∫"). Falls back to the original
+    /// event if no rewrite is needed or if NSEvent.keyEvent fails.
+    private func translatedEvent(for event: NSEvent) -> NSEvent {
+        guard let surface else { return event }
+        let originalMods = mods(event)
+        let translationModsRaw = ghostty_surface_key_translation_mods(surface, originalMods).rawValue
+        var translationFlags = event.modifierFlags
+        for (bit, flag) in [
+            (GHOSTTY_MODS_SHIFT.rawValue, NSEvent.ModifierFlags.shift),
+            (GHOSTTY_MODS_CTRL.rawValue, NSEvent.ModifierFlags.control),
+            (GHOSTTY_MODS_ALT.rawValue, NSEvent.ModifierFlags.option),
+            (GHOSTTY_MODS_SUPER.rawValue, NSEvent.ModifierFlags.command),
+        ] {
+            if translationModsRaw & bit != 0 { translationFlags.insert(flag) } else { translationFlags.remove(flag) }
+        }
+        if translationFlags == event.modifierFlags { return event }
+        let translatedChars = event.characters(byApplyingModifiers: translationFlags) ?? ""
+        return NSEvent.keyEvent(
+            with: event.type,
+            location: event.locationInWindow,
+            modifierFlags: translationFlags,
+            timestamp: event.timestamp,
+            windowNumber: event.windowNumber,
+            context: nil,
+            characters: translatedChars,
+            charactersIgnoringModifiers: event.charactersIgnoringModifiers ?? "",
+            isARepeat: event.isARepeat,
+            keyCode: event.keyCode
+        ) ?? event
+    }
+
+    private func unshiftedCodepoint(from event: NSEvent) -> UInt32 {
+        guard event.type == .keyDown || event.type == .keyUp,
+              let chars = event.characters(byApplyingModifiers: []),
+              let scalar = chars.unicodeScalars.first
+        else { return 0 }
+        return scalar.value
+    }
+
+    // MARK: - Drag & drop
+
+    /// Pasteboard types we accept when something is dragged onto the surface.
+    private static let dropTypes: Set<NSPasteboard.PasteboardType> = [.string, .fileURL, .URL]
+
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        guard let types = sender.draggingPasteboard.types, !Set(types).isDisjoint(with: Self.dropTypes) else {
+            return []
+        }
+        // .copy gives the drop the familiar green "+" cursor.
+        return .copy
+    }
+
+    /// Drops insert the escaped file path(s) / URL at the cursor. File URLs are
+    /// shell-escaped individually and space-joined; plain strings are inserted
+    /// verbatim (they may be a command the user means to run).
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        let pb = sender.draggingPasteboard
+
+        let content: String? = if let url = pb.string(forType: .URL) {
+            GhosttyCallbacks.shellEscape(url)
+        } else if let urls = pb.readObjects(forClasses: [NSURL.self]) as? [URL], !urls.isEmpty {
+            urls
+                .map { GhosttyCallbacks.shellEscape($0.path(percentEncoded: false)) }
+                .joined(separator: " ")
+        } else if let str = pb.string(forType: .string) {
+            str
+        } else {
+            nil
+        }
+
+        guard let content else { return false }
+        // Defer the insert (as Ghostty does) so the drag session fully unwinds
+        // before we mutate the terminal buffer.
+        DispatchQueue.main.async {
+            self.insertText(content, replacementRange: NSRange(location: 0, length: 0))
+        }
+        return true
+    }
+}
+
+// MARK: - Programmatic text input
+
+extension GhosttyTerminalNSView {
+    /// Write text to the terminal as if pasted — the same `ghostty_surface_key`
+    /// text path `insertText` takes outside a key event, bypassing keyboard
+    /// handling entirely. The control CLI's `pane run` uses this to type a
+    /// command (plus newline) into a live shell. Returns false when the
+    /// surface doesn't exist yet, so callers can report the miss instead of
+    /// silently dropping input.
+    @discardableResult
+    func sendText(_ text: String) -> Bool {
+        guard let surface, !text.isEmpty else { return false }
+        // Same liveness signal a keystroke sends (execution tracking + poll
+        // resume), so an injected command updates the tab title promptly.
+        onInteraction?()
+        recordCommandInput(text)
+        text.withCString { ptr in
+            var ke = ghostty_input_key_s()
+            ke.action = GHOSTTY_ACTION_PRESS
+            ke.text = ptr
+            _ = ghostty_surface_key(surface, ke)
+        }
+        if TerminalCommandSubmission.textContainsNewline(text) {
+            let hasContent = consumeCommandSubmissionEvidence()
+            onCommandSubmitted?(hasContent)
+            if hasContent { preserveProgrammaticCommandInput(text) }
+        }
+        return true
+    }
+
+    /// Send a single key chord through libghostty's key-*encoding* path — the
+    /// same `ghostty_surface_key` route a real `keyDown` takes, NOT the text
+    /// paste path `sendText` uses. This is what lets the control CLI deliver a
+    /// control key (`ctrl+c`, `ctrl+\`), a named key (`escape`, `tab`, `up`), or
+    /// any modified chord that has no literal text form. libghostty does the
+    /// mode-dependent encoding (control bytes, application cursor keys, Kitty
+    /// protocol) from `keycode` + `mods`, so callers pass primitives, not bytes.
+    ///
+    /// A full press→release cycle is issued so encodings that distinguish the
+    /// two (e.g. Kitty keyboard) see a complete event. Returns false when the
+    /// surface isn't created yet, so the caller can report the miss.
+    ///
+    /// `keyCode` is a hardware key code (Carbon `kVK_*`), `mods` the modifier
+    /// set — exactly what `HotkeyRegistry.parseShortcut` yields, so the CLI can
+    /// reuse that grammar (`\` → 42, `c` → 8, `escape` → 53, `up` → 126).
+    @discardableResult
+    func sendKey(keyCode: UInt16, mods flags: NSEvent.ModifierFlags) -> Bool {
+        guard let surface else { return false }
+        onInteraction?()
+        if TerminalCommandSubmission.clearsInputEvidence(
+            keyCode: keyCode,
+            hasControl: flags.contains(.control),
+            hasCommand: flags.contains(.command)
+        ) {
+            clearCommandSubmissionEvidence()
+        }
+        var m = GHOSTTY_MODS_NONE.rawValue
+        if flags.contains(.shift) { m |= GHOSTTY_MODS_SHIFT.rawValue }
+        if flags.contains(.control) { m |= GHOSTTY_MODS_CTRL.rawValue }
+        if flags.contains(.option) { m |= GHOSTTY_MODS_ALT.rawValue }
+        if flags.contains(.command) { m |= GHOSTTY_MODS_SUPER.rawValue }
+        let mods = ghostty_input_mods_e(rawValue: m)
+        // The unshifted codepoint lets libghostty compute the control byte for
+        // letter chords (`ctrl+c` → keycode 8, unshifted 0x63 → 0x03). Named /
+        // non-character keys leave it 0 and are driven by keycode alone.
+        let codepoint = Self.unshiftedCodepoint(forKeyCode: keyCode)
+        for action in [GHOSTTY_ACTION_PRESS, GHOSTTY_ACTION_RELEASE] {
+            var ke = ghostty_input_key_s()
+            ke.action = action
+            ke.keycode = UInt32(keyCode)
+            ke.mods = mods
+            ke.consumed_mods = GHOSTTY_MODS_NONE
+            ke.composing = false
+            ke.text = nil
+            ke.unshifted_codepoint = codepoint
+            _ = ghostty_surface_key(surface, ke)
+        }
+        let userModifiers: NSEvent.ModifierFlags = [.shift, .control, .option, .command]
+        if TerminalCommandSubmission.isReturn(
+            keyCode: keyCode,
+            isRepeat: false,
+            hasMarkedText: false,
+            hasUserModifiers: !flags.isDisjoint(with: userModifiers)
+        ) {
+            onCommandSubmitted?(consumeCommandSubmissionEvidence())
+        }
+        return true
+    }
+
+    /// The unshifted Unicode scalar for a hardware key code, for the small set
+    /// of keys the control CLI can address. Mirrors what `keyDown` derives from
+    /// `NSEvent.characters(byApplyingModifiers: [])`, but from a keycode alone
+    /// since a CLI-driven key has no NSEvent. 0 for keys with no single base
+    /// character (arrows, tab, escape) — libghostty encodes those from keycode.
+    private static func unshiftedCodepoint(forKeyCode keyCode: UInt16) -> UInt32 {
+        guard let token = HotkeyRegistry.baseToken(forKeyCode: keyCode),
+              token.count == 1, let scalar = token.unicodeScalars.first
+        else { return 0 }
+        return scalar.value
+    }
+}
+
+// MARK: - Read-only introspection (control CLI `pane inspect`/`dump`)
+
+extension GhosttyTerminalNSView {
+    /// The live terminal grid + cell/surface pixel dimensions
+    /// (`ghostty_surface_size`), or nil when the surface isn't created yet.
+    var surfaceSize: ghostty_surface_size_s? {
+        guard let surface else { return nil }
+        return ghostty_surface_size(surface)
+    }
+
+    /// Whether libghostty considers the child process exited.
+    var processExited: Bool {
+        guard let surface else { return false }
+        return ghostty_surface_process_exited(surface)
+    }
+
+    /// Read cell text out of the terminal core via `ghostty_surface_read_text`.
+    /// `scrollback == false` returns the visible viewport; `true` returns the
+    /// full screen including scrollback. nil when there's no surface or the
+    /// core declines the read. This is the same API ghostty's own app uses for
+    /// its cached screen/visible contents.
+    func readText(scrollback: Bool) -> String? {
+        guard let surface else { return nil }
+        let tag = scrollback ? GHOSTTY_POINT_SCREEN : GHOSTTY_POINT_VIEWPORT
+        let sel = ghostty_selection_s(
+            top_left: ghostty_point_s(tag: tag, coord: GHOSTTY_POINT_COORD_TOP_LEFT, x: 0, y: 0),
+            bottom_right: ghostty_point_s(tag: tag, coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT, x: 0, y: 0),
+            rectangle: false
+        )
+        var text = ghostty_text_s()
+        guard ghostty_surface_read_text(surface, sel, &text) else { return nil }
+        defer { ghostty_surface_free_text(surface, &text) }
+        guard let ptr = text.text else { return "" }
+        return String(cString: ptr)
+    }
+
+    #if DEBUG
+    /// DEBUG-ONLY: drive `ghostty_surface_set_size` once, directly, bypassing
+    /// SwiftUI layout — so a resize/reflow transition can be reproduced in
+    /// isolation (issue #167) instead of confounded with the reparent + layout
+    /// storm the normal path fires. Converts the requested grid to backing
+    /// pixels via the live cell dimensions. Returns false if the surface isn't
+    /// ready or the cell size is unknown. Never compiled into Release.
+    @discardableResult
+    func debugResizeSurface(cols: Int, rows: Int) -> Bool {
+        guard let surface, cols > 0, rows > 0 else { return false }
+        let size = ghostty_surface_size(surface)
+        guard size.cell_width_px > 0, size.cell_height_px > 0 else { return false }
+        let widthPx = UInt32(cols) * size.cell_width_px
+        let heightPx = UInt32(rows) * size.cell_height_px
+        ghostty_surface_set_size(surface, widthPx, heightPx)
+        return true
+    }
+    #endif
+}
+
+// MARK: - NSTextInputClient
+
+extension GhosttyTerminalNSView: @preconcurrency NSTextInputClient {
+    func insertText(_ string: Any, replacementRange: NSRange) {
+        let text = (string as? String) ?? (string as? NSAttributedString)?.string ?? ""
+        // A commit always ends the composition — including an empty one, which
+        // is how some input sources signal "abandon what you were composing".
+        // Clearing before the empty-text bail keeps `hasMarkedText` honest.
+        _markedRange = NSRange(location: NSNotFound, length: 0)
+        if let surface { ghostty_surface_preedit(surface, nil, 0) }
+        guard !text.isEmpty else { return }
+        if currentKeyEvent != nil {
+            keyTextAccumulator.append(text)
+        } else if let surface {
+            text.withCString { ptr in
+                var ke = ghostty_input_key_s()
+                ke.action = GHOSTTY_ACTION_PRESS
+                ke.text = ptr
+                _ = ghostty_surface_key(surface, ke)
+            }
+            recordCommandInput(text)
+        }
+    }
+
+    /// `_markedRange` mirrors AppKit's composition state, so it is maintained on
+    /// EVERY call the input system makes — never gated on there being a surface.
+    /// A `guard let surface` here used to skip the bookkeeping, which desynced
+    /// the mirror from AppKit in both directions across a `destroySurface()`:
+    /// a composition begun without a surface read as not-composing, and one
+    /// ended without a surface stayed marked forever. The latter is the
+    /// damaging direction — see `discardMarkedText`.
+    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        let text = (string as? String) ?? (string as? NSAttributedString)?.string ?? ""
+        _markedRange = text.isEmpty ? NSRange(location: NSNotFound, length: 0) : NSRange(location: 0, length: text.utf16.count)
+        guard let surface else { return }
+        text.withCString { ghostty_surface_preedit(surface, $0, UInt(text.utf8.count)) }
+    }
+
+    func unmarkText() {
+        _markedRange = NSRange(location: NSNotFound, length: 0)
+        if let surface { ghostty_surface_preedit(surface, nil, 0) }
+    }
+
+    func selectedRange() -> NSRange {
+        guard let surface else { return NSRange() }
+        var text = ghostty_text_s()
+        guard ghostty_surface_read_selection(surface, &text) else { return NSRange() }
+        defer { ghostty_surface_free_text(surface, &text) }
+        return NSRange(location: Int(text.offset_start), length: Int(text.offset_len))
+    }
+
+    /// Live selection for `pane.selection`. Nil only when there is no surface.
+    /// `start`/`length` are viewport UTF-16 (same unit as `selectText` /
+    /// `pane.select --start/--length`). Screen-buffer offsets from libghostty
+    /// are mapped with `TerminalAccessibilityText.viewportSelection`. Empty
+    /// or history-only selection is `hasSelection: false` with zeros.
+    func selectionSnapshot() -> ControlPaneSelection? {
+        guard surface != nil else { return nil }
+        let empty = ControlPaneSelection(
+            session: "", hasSelection: false, text: "", start: 0, length: 0
+        )
+        let screenRange = selectedRange()
+        if screenRange.length == 0 { return empty }
+        let viewport = readText(scrollback: false) ?? ""
+        let screen = readText(scrollback: true) ?? viewport
+        let viewportRange = TerminalAccessibilityText.viewportSelection(
+            screenRange: screenRange,
+            viewport: viewport,
+            screen: screen
+        )
+        guard viewportRange.length > 0,
+              let selected = TerminalAccessibilityText.string(for: viewportRange, in: viewport),
+              !selected.isEmpty
+        else { return empty }
+        return ControlPaneSelection(
+            session: "",
+            hasSelection: true,
+            text: selected,
+            start: viewportRange.location,
+            length: viewportRange.length
+        )
+    }
+
+    func markedRange() -> NSRange {
+        _markedRange
+    }
+
+    func hasMarkedText() -> Bool {
+        _markedRange.location != NSNotFound
+    }
+
+    /// Abandons an in-flight IME composition, clearing both our mirror of it
+    /// and the input source's own state.
+    ///
+    /// AppKit does not promise an `unmarkText` (or a commit) when focus leaves
+    /// a view mid-composition, and a stranded `_markedRange` is not a cosmetic
+    /// leak: `keyDown`'s composing branch forwards NOTHING for an unmodified
+    /// key — not the translated text, not even an encoded keypress — so the
+    /// pane's keyboard goes dead for ordinary typing while modifier chords keep
+    /// working. Nothing in the view could recover from that state on its own,
+    /// because the only two exits (`insertText`/`unmarkText`) are calls the
+    /// input system makes and it believes the composition is already over.
+    ///
+    /// `discardMarkedText()` is what tells the input source to drop its half;
+    /// our own state is cleared first so a re-entrant callback can't revive it.
+    /// `inputContext` is read before `super.resignFirstResponder()` runs, since
+    /// AppKit returns nil for a view that is no longer the first responder.
+    func discardMarkedText() {
+        guard hasMarkedText() else { return }
+        unmarkText()
+        inputContext?.discardMarkedText()
+    }
+
+    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
+        nil
+    }
+
+    func validAttributesForMarkedText() -> [NSAttributedString.Key] {
+        [.underlineStyle, .backgroundColor]
+    }
+
+    func characterIndex(for point: NSPoint) -> Int {
+        NSNotFound
+    }
+
+    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
+        guard let surface else { return .zero }
+        var x: Double = 0, y: Double = 0, w: Double = 0, h: Double = 0
+        ghostty_surface_ime_point(surface, &x, &y, &w, &h)
+        let viewPt = NSPoint(x: x, y: bounds.height - y)
+        let screenPt = window?.convertPoint(toScreen: convert(viewPt, to: nil)) ?? viewPt
+        return NSRect(x: screenPt.x, y: screenPt.y - h, width: w, height: h)
+    }
+}
+
+/// Viewport UTF-16 range ↔ 1-based cell mapping. Pure so tests need no surface.
+enum TerminalSelectionMapping {
+    enum DragKind {
+        /// Center press+release (click-to-clear).
+        case click
+        /// Leading edge of start → trailing edge of end (reading order).
+        case select
+    }
+
+    enum Anchor {
+        case center
+        case leading
+        case trailing
+    }
+
+    /// One cell per UTF-16 unit except newlines, which only advance the row.
+    static func cells(for range: NSRange, in text: String) -> (
+        start: (col: Int, row: Int),
+        end: (col: Int, row: Int)
+    )? {
+        guard range.location != NSNotFound, range.location >= 0, range.length >= 0 else { return nil }
+        let utf16 = text.utf16
+        let count = utf16.count
+        guard range.location <= count, range.length <= count - range.location else { return nil }
+
+        var atOffset: [(col: Int, row: Int)?] = []
+        atOffset.reserveCapacity(count)
+        var col = 1
+        var row = 1
+        let newline: UTF16.CodeUnit = 0x0A
+        for unit in utf16 {
+            if unit == newline {
+                atOffset.append(nil)
+                row += 1
+                col = 1
+            } else {
+                atOffset.append((col, row))
+                col += 1
+            }
+        }
+
+        if range.length == 0 {
+            let loc = range.location
+            if loc < count, let cell = atOffset[loc] {
+                return (cell, cell)
+            }
+            if loc > 0 {
+                for i in stride(from: loc - 1, through: 0, by: -1) {
+                    if let cell = atOffset[i] {
+                        return (cell, cell)
+                    }
+                }
+            }
+            return nil
+        }
+
+        let lower = range.location
+        let upper = range.location + range.length
+        var start: (col: Int, row: Int)?
+        var end: (col: Int, row: Int)?
+        for i in lower ..< upper {
+            if let cell = atOffset[i] {
+                if start == nil { start = cell }
+                end = cell
+            }
+        }
+        guard let start, let end else { return nil }
+        return (start, end)
+    }
+
+    /// Point on a 1-based cell in top-left view points (same space as `mousePoint(from:)`).
+    static func mousePoint(
+        cell: (col: Int, row: Int),
+        grid: (columns: Int, rows: Int),
+        cellSize: (width: CGFloat, height: CGFloat),
+        anchor: Anchor = .center
+    ) -> NSPoint? {
+        guard grid.columns > 0, grid.rows > 0 else { return nil }
+        guard cell.col >= 1, cell.row >= 1, cell.col <= grid.columns, cell.row <= grid.rows else { return nil }
+        guard cellSize.width > 0, cellSize.height > 0 else { return nil }
+        let x: CGFloat = switch anchor {
+        case .center: (CGFloat(cell.col) - 0.5) * cellSize.width
+        case .leading: CGFloat(cell.col - 1) * cellSize.width
+        case .trailing: CGFloat(cell.col) * cellSize.width
+        }
+        return NSPoint(
+            x: x,
+            y: (CGFloat(cell.row) - 0.5) * cellSize.height
+        )
+    }
+
+    /// Press and release points for a click (same center) or a select drag
+    /// (leading→trailing in reading order, trailing→leading when reversed).
+    static func dragPoints(
+        from start: (col: Int, row: Int),
+        to end: (col: Int, row: Int),
+        grid: (columns: Int, rows: Int),
+        cellSize: (width: CGFloat, height: CGFloat),
+        kind: DragKind
+    ) -> (start: NSPoint, end: NSPoint)? {
+        let startAnchor: Anchor
+        let endAnchor: Anchor
+        switch kind {
+        case .click:
+            startAnchor = .center
+            endAnchor = .center
+        case .select:
+            if isBeforeOrEqual(start, end) {
+                startAnchor = .leading
+                endAnchor = .trailing
+            } else {
+                startAnchor = .trailing
+                endAnchor = .leading
+            }
+        }
+        guard let startPt = mousePoint(cell: start, grid: grid, cellSize: cellSize, anchor: startAnchor),
+              let endPt = mousePoint(cell: end, grid: grid, cellSize: cellSize, anchor: endAnchor)
+        else { return nil }
+        return (startPt, endPt)
+    }
+
+    private static func isBeforeOrEqual(
+        _ a: (col: Int, row: Int),
+        _ b: (col: Int, row: Int)
+    ) -> Bool {
+        if a.row != b.row { return a.row < b.row }
+        return a.col <= b.col
+    }
+}
+
+/// VoiceOver button for one numbered TUI row. Parent stays a text area.
+/// Not `@MainActor`: AppKit's press/frame overrides are nonisolated, so
+/// work hops through Sendable `@MainActor` closures (no isolated `self`).
+final class NumberedChoiceAXElement: NSAccessibilityElement {
+    private let choiceIndex: Int
+    private let activate: @MainActor (Int) -> Bool
+    private let frame: @MainActor () -> NSRect
+
+    init(
+        parent: GhosttyTerminalNSView,
+        index: Int,
+        title: String,
+        activate: @escaping @MainActor (Int) -> Bool,
+        frame: @escaping @MainActor () -> NSRect
+    ) {
+        choiceIndex = index
+        self.activate = activate
+        self.frame = frame
+        super.init()
+        setAccessibilityRole(.button)
+        setAccessibilityTitle(title)
+        setAccessibilityLabel(title)
+        setAccessibilityHelp("Terminal choice \(index)")
+        setAccessibilityParent(parent)
+    }
+
+    override func accessibilityFrame() -> NSRect {
+        let frame = frame
+        return MainActor.assumeIsolated {
+            frame()
+        }
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        let index = choiceIndex
+        let activate = activate
+        return MainActor.assumeIsolated {
+            activate(index)
+        }
+    }
+}
+
+/// UTF-16 line/range helpers for the viewport AX string. Pure so tests need no surface.
+enum TerminalAccessibilityText {
+    static func utf16Count(_ text: String) -> Int {
+        (text as NSString).length
+    }
+
+    static func line(for index: Int, in text: String) -> Int {
+        let ns = text as NSString
+        let length = ns.length
+        guard length > 0 else { return 0 }
+        let clamped = min(max(index, 0), length)
+        var line = 0
+        var i = 0
+        while i < clamped {
+            if ns.character(at: i) == 0x0A { line += 1 }
+            i += 1
+        }
+        return line
+    }
+
+    static func range(forLine line: Int, in text: String) -> NSRange {
+        let ns = text as NSString
+        guard line >= 0, ns.length > 0 else { return NSRange() }
+        var current = 0
+        var start = 0
+        var i = 0
+        while i < ns.length {
+            if ns.character(at: i) == 0x0A {
+                if current == line {
+                    return NSRange(location: start, length: i - start + 1)
+                }
+                current += 1
+                start = i + 1
+            }
+            i += 1
+        }
+        if current == line {
+            return NSRange(location: start, length: ns.length - start)
+        }
+        return NSRange()
+    }
+
+    static func string(for range: NSRange, in text: String) -> String? {
+        let ns = text as NSString
+        guard range.location != NSNotFound, range.location >= 0, range.length >= 0,
+              NSMaxRange(range) <= ns.length
+        else { return nil }
+        return ns.substring(with: range)
+    }
+
+    static func viewportSelection(
+        screenRange: NSRange,
+        viewport: String,
+        screen: String
+    ) -> NSRange {
+        let vLen = (viewport as NSString).length
+        let sLen = (screen as NSString).length
+        guard screenRange.location != NSNotFound, screenRange.location >= 0, screenRange.length >= 0
+        else { return NSRange() }
+        let screenEnd = screenRange.location + screenRange.length
+        // Screen UTF-16: subtract the hidden prefix (`sLen - vLen`) and clip
+        // to the viewport. A history-only range (e.g. `{0,2}` on
+        // `"xx\nab\ncd\n"`) must not be reported as the first viewport cells.
+        let offset = max(0, sLen - vLen)
+        let start = screenRange.location - offset
+        let end = screenEnd - offset
+        let clippedStart = max(0, start)
+        let clippedEnd = min(vLen, end)
+        if clippedEnd <= clippedStart { return NSRange() }
+        return NSRange(location: clippedStart, length: clippedEnd - clippedStart)
+    }
+}
