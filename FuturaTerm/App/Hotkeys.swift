@@ -1,0 +1,504 @@
+import AppKit
+import Foundation
+import os
+
+@MainActor
+final class HotkeyCaptureState {
+    static let shared = HotkeyCaptureState()
+    var isCapturing = false
+}
+
+enum HotkeyAction: String, CaseIterable, Identifiable {
+    case newTab = "new_tab"
+    case closePane = "close_pane"
+    case closeTab = "close_tab"
+    case splitRight = "split_right"
+    case splitDown = "split_down"
+    case splitAuto = "split_auto"
+    case toggleSidebar = "toggle_sidebar"
+    case recentTab = "recent_tab"
+    case nextProject = "next_project"
+    case previousProject = "previous_project"
+    case nextGlobalTab = "next_global_tab"
+    case previousGlobalTab = "previous_global_tab"
+    case nextTabInProject = "next_tab_in_project"
+    case previousTabInProject = "previous_tab_in_project"
+    case focusPaneLeft = "focus_pane_left"
+    case focusPaneDown = "focus_pane_down"
+    case focusPaneUp = "focus_pane_up"
+    case focusPaneRight = "focus_pane_right"
+    case nextPane = "next_pane"
+    case previousPane = "previous_pane"
+    case resizePaneLeft = "resize_pane_left"
+    case resizePaneDown = "resize_pane_down"
+    case resizePaneUp = "resize_pane_up"
+    case resizePaneRight = "resize_pane_right"
+    case closeWindow = "close_window"
+    case openProject = "open_project"
+    case zoomPane = "zoom_pane"
+    case toggleCommandPalette = "toggle_command_palette"
+    case reloadGhosttyConfig = "reload_ghostty_config"
+    case toggleQuickTerminal = "toggle_quick_terminal"
+    case renameTab = "rename_tab"
+    case renameProject = "rename_project"
+    case copySessionID = "copy_session_id"
+    case applyLayout = "apply_layout"
+    case saveLayout = "save_layout"
+    case separateAllPanes = "separate_all_panes"
+    case separateCurrentPane = "separate_current_pane"
+    case pinTab = "pin_tab"
+    case unpinTab = "unpin_tab"
+
+    var id: String { rawValue }
+
+    /// User-facing name. Sourced from `AppCommand` so the palette and
+    /// Settings don't drift apart.
+    var title: String { appCommand.title }
+
+    var defaultsKey: String { "futuraterm.hotkey.\(rawValue)" }
+
+    /// Legacy key. Reads copy into `defaultsKey` so an upgrade keeps the
+    /// user's bindings.
+    var legacyDefaultsKey: String { "macterm.hotkey.\(rawValue)" }
+
+    /// Per-action opt-in (default off): while a full-screen program owns the
+    /// focused pane's keyboard, hand this binding's chord to the program
+    /// instead of firing the action. Separate key from `defaultsKey` so a
+    /// rebind and a passthrough change don't clobber each other.
+    var passthroughDefaultsKey: String { "futuraterm.hotkey.\(rawValue).passthrough" }
+
+    /// Legacy key for the passthrough opt-in.
+    var legacyPassthroughDefaultsKey: String { "macterm.hotkey.\(rawValue).passthrough" }
+
+    var defaultShortcut: String {
+        switch self {
+        case .newTab: "cmd+t"
+        case .closePane: "cmd+w"
+        // Stock binding is Cmd+Shift+T. Distinct from Cmd+W Close Pane:
+        // this ends every session in the tab (busy panes still confirm;
+        // a pinned tab only unloads).
+        case .closeTab: "cmd+shift+t"
+        case .splitRight: "cmd+d"
+        case .splitDown: "cmd+shift+d"
+        case .splitAuto: "none"
+        case .toggleSidebar: "cmd+\\"
+        case .recentTab: "ctrl+tab"
+        case .nextProject: "cmd+]"
+        case .previousProject: "cmd+["
+        // ctrl+]/ctrl+[ drive the project-scoped pair: cycling stops at the
+        // project's own tabs, which is what a workspace boundary implies. The
+        // cross-project pair keeps the chord's old job but ships unbound —
+        // both pairs on one chord would register as a conflict in Settings,
+        // and the responder's global branch runs first, so it would simply
+        // shadow the scoped one. Users who want the old reach rebind it.
+        case .nextGlobalTab: "none"
+        case .previousGlobalTab: "none"
+        case .nextTabInProject: "ctrl+]"
+        case .previousTabInProject: "ctrl+["
+        case .focusPaneLeft: "cmd+ctrl+h"
+        case .focusPaneDown: "cmd+ctrl+j"
+        case .focusPaneUp: "cmd+ctrl+k"
+        case .focusPaneRight: "cmd+ctrl+l"
+        case .nextPane: "none"
+        case .previousPane: "none"
+        case .resizePaneLeft: "cmd+shift+h"
+        case .resizePaneDown: "cmd+shift+j"
+        case .resizePaneUp: "cmd+shift+k"
+        case .resizePaneRight: "cmd+shift+l"
+        case .closeWindow: "cmd+shift+w"
+        case .openProject: "cmd+o"
+        case .zoomPane: "cmd+shift+return"
+        case .toggleCommandPalette: "cmd+p"
+        case .reloadGhosttyConfig: "cmd+shift+,"
+        case .toggleQuickTerminal: "ctrl+`"
+        case .renameTab: "cmd+r"
+        case .renameProject: "none"
+        case .copySessionID: "none"
+        // Unbound by default: both rewrite or replace the live pane tree, so a
+        // stray keystroke on a stock binding would be destructive.
+        case .applyLayout: "none"
+        case .saveLayout: "none"
+        // Unbound by default for the same reason: both restructure the live
+        // pane tree (shells survive, but the layout doesn't).
+        case .separateAllPanes: "none"
+        case .separateCurrentPane: "none"
+        // Unbound by default: pinning moves the tab between sidebar sections,
+        // which is disorienting from a stray chord.
+        case .pinTab: "none"
+        case .unpinTab: "none"
+        }
+    }
+}
+
+struct HotkeyShortcut: Identifiable {
+    let id: String
+    let keyCode: UInt16 // Hardware keyCode for Carbon global hotkey registration.
+    let keyToken: String // Logical key token used for local NSEvent matching.
+    let modifiers: NSEvent.ModifierFlags
+
+    /// Match by logical character, not hardware keyCode.
+    func matches(_ event: NSEvent) -> Bool {
+        guard let token = HotkeyRegistry.eventToken(event),
+              token == keyToken
+        else { return false }
+        return event.modifierFlags.intersection(HotkeyRegistry.comparableModifierMask) == modifiers
+    }
+}
+
+enum HotkeyRegistry {
+    /// Modifier bits FuturaTerm's shortcut grammar models. Real arrow/function-key
+    /// NSEvents also carry `.numericPad`/`.function` in `.deviceIndependentFlagsMask`,
+    /// which parsed shortcuts never include — so matching against the full mask
+    /// makes every arrow-key binding fail to match its own live event.
+    static let comparableModifierMask: NSEvent.ModifierFlags = [.command, .control, .shift, .option]
+
+    private static let keyCodes: [String: UInt16] = [
+        "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5,
+        "z": 6, "x": 7, "c": 8, "v": 9, "b": 11,
+        "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17,
+        "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23,
+        "=": 24, "9": 25, "7": 26, "-": 27, "8": 28, "0": 29,
+        "]": 30, "o": 31, "u": 32, "[": 33, "i": 34, "p": 35,
+        "return": 36, "enter": 36,
+        "l": 37, "j": 38,
+        "'": 39, "k": 40, ";": 41, "\\": 42,
+        ",": 43, "/": 44, "n": 45, "m": 46, ".": 47,
+        "tab": 48, "space": 49, "`": 50,
+        "escape": 53,
+        "left": 123, "right": 124, "down": 125, "up": 126,
+    ]
+
+    /// Reverse mapping: hardware keyCode → base key token.
+    /// Used as a fallback when `charactersIgnoringModifiers` yields a shifted
+    /// symbol (e.g. `<` from `shift+,`) that is not itself a valid key token.
+    /// Populated from one representative per keyCode (lowercase for letters,
+    /// unshifted for symbols).
+    private static let keyCodeToBaseToken: [UInt16: String] = {
+        var result: [UInt16: String] = [:]
+        // Letters → lowercase
+        for letter in "abcdefghijklmnopqrstuvwxyz" {
+            if let code = keyCodes[String(letter)] { result[code] = String(letter) }
+        }
+        // Digits → digit
+        for digit in "0123456789" {
+            if let code = keyCodes[String(digit)] { result[code] = String(digit) }
+        }
+        // Symbols and special keys — pick the unshifted/base form per keyCode.
+        let baseEntries: [String: UInt16] = [
+            "=": 24, "-": 27, "]": 30, "[": 33,
+            "'": 39, ";": 41, "\\": 42, ",": 43, "/": 44, ".": 47,
+            "tab": 48, "space": 49, "`": 50,
+            "return": 36, "escape": 53,
+            "left": 123, "right": 124, "down": 125, "up": 126,
+        ]
+        for (token, code) in baseEntries {
+            result[code] = token
+        }
+        // Keypad Enter (kVK_ANSI_KeypadEnter = 76) is a distinct hardware key
+        // from Return (36) and emits no `charactersIgnoringModifiers` we map,
+        // so without this a keypad-Enter press produced no token and could
+        // neither be bound nor match a `return` binding. Fold it to `return`.
+        result[76] = "return"
+        return result
+    }()
+
+    /// The unshifted/base key token for a hardware key code (lowercase letter,
+    /// digit, or unshifted symbol), or nil for a code we don't map. Exposes the
+    /// private reverse map so `GhosttyTerminalNSView.sendKey` can derive a key's
+    /// base codepoint from a keycode alone (CLI-driven keys have no NSEvent).
+    static func baseToken(forKeyCode keyCode: UInt16) -> String? {
+        keyCodeToBaseToken[keyCode]
+    }
+
+    /// The hardware key code for a base key token (`"c"` → 8), or nil for a
+    /// token we don't map — the inverse of `baseToken(forKeyCode:)`. Lets code
+    /// that carries its own key codes (`TerminalCommandSubmission`, which stays
+    /// isolation-free and so can't read this `@MainActor` map at runtime) pin
+    /// them to this vocabulary in a test.
+    static func keyCode(forToken token: String) -> UInt16? {
+        keyCodes[token]
+    }
+
+    private static let modifierOnlyCodes: Set<UInt16> = [54, 55, 56, 57, 58, 59, 60, 61, 62]
+
+    /// Characters produced by special keys → their named token form.
+    private static let specialCharsToToken: [String: String] = [
+        "\t": "tab",
+        "\r": "return",
+        " ": "space",
+        "\u{1b}": "escape",
+    ]
+
+    /// Normalize an NSEvent's key to a token string.
+    ///
+    /// Priority:
+    /// 1. Special chars (tab, return, space, escape)
+    /// 2. Single printable ASCII that is itself a known key token → use as-is
+    ///    (handles letters, digits, unshifted symbols — correct for Colemak/AZERTY)
+    /// 3. Printable but NOT a known key token (e.g. `<`, `?`, `!` from shifted
+    ///    symbols) → fall back to `keyCodeToBaseToken` to recover the base key
+    /// 4. Empty chars → arrow/non-character keys by keyCode
+    static func eventToken(_ event: NSEvent) -> String? {
+        guard let chars = event.charactersIgnoringModifiers else {
+            return Self.keyCodeToBaseToken[event.keyCode]
+        }
+
+        // Special named keys
+        if let token = specialCharsToToken[chars] { return token }
+
+        // Single printable ASCII
+        if chars.count == 1, let scalar = chars.unicodeScalars.first,
+           scalar.value >= 0x20, scalar.value < 0x7F
+        {
+            let lower = chars.lowercased()
+            // If the char itself is a known key token, use it directly.
+            // This is the correct path for letters (layout-independent),
+            // digits, and unshifted symbols.
+            if keyCodes[lower] != nil { return lower }
+            // Printable but not a known token (e.g. "<" from shift+, "?")
+            // → fall back to the keyCode → base-token mapping.
+            if let token = Self.keyCodeToBaseToken[event.keyCode] { return token }
+            return nil
+        }
+
+        // Empty or multi-char → try named non-character keys by position
+        return Self.keyCodeToBaseToken[event.keyCode]
+    }
+
+    /// Fold input aliases to the single canonical token the event-matching
+    /// path can actually produce. `"enter"` validates (it's in `keyCodes`) but
+    /// `eventToken` only ever emits `"return"` for that key, so an un-normalized
+    /// `"enter"` binding would validate in Settings yet never fire. Normalizing
+    /// here keeps the set of tokens that parse identical to the set that match.
+    private static func canonicalKeyToken(_ token: String) -> String {
+        token == "enter" ? "return" : token
+    }
+
+    static func parseShortcut(_ raw: String) -> HotkeyShortcut? {
+        let cleaned = raw.lowercased().replacingOccurrences(of: " ", with: "")
+        if cleaned.isEmpty || cleaned == "none" || cleaned == "disabled" {
+            return nil
+        }
+
+        let tokens = cleaned.split(separator: "+").map(String.init)
+        guard let rawKeyToken = tokens.last else { return nil }
+        let keyToken = canonicalKeyToken(rawKeyToken)
+        guard let keyCode = keyCodes[keyToken] else {
+            return nil
+        }
+
+        var modifiers: NSEvent.ModifierFlags = []
+        for token in tokens.dropLast() {
+            switch token {
+            case "cmd",
+                 "command",
+                 "⌘": modifiers.insert(.command)
+            case "ctrl",
+                 "control",
+                 "⌃": modifiers.insert(.control)
+            case "shift",
+                 "⇧": modifiers.insert(.shift)
+            case "opt",
+                 "option",
+                 "alt",
+                 "⌥": modifiers.insert(.option)
+            default: return nil
+            }
+        }
+
+        return HotkeyShortcut(id: cleaned, keyCode: keyCode, keyToken: keyToken, modifiers: modifiers)
+    }
+
+    static func shortcutString(from event: NSEvent) -> String? {
+        let flags = event.modifierFlags.intersection(comparableModifierMask)
+        if modifierOnlyCodes.contains(event.keyCode) { return nil }
+
+        var parts: [String] = []
+        if flags.contains(.command) { parts.append("cmd") }
+        if flags.contains(.control) { parts.append("ctrl") }
+        if flags.contains(.shift) { parts.append("shift") }
+        if flags.contains(.option) { parts.append("opt") }
+        guard !parts.isEmpty else { return nil }
+
+        guard let keyToken = eventToken(event) else { return nil }
+        guard keyCodes[keyToken] != nil else { return nil }
+        parts.append(keyToken)
+        return parts.joined(separator: "+")
+    }
+
+    static func displayString(for shortcut: String) -> String {
+        let symbols = displaySymbols(for: shortcut)
+        return symbols.isEmpty ? "None" : symbols.joined()
+    }
+
+    /// The shortcut's modifier glyphs and key label as separate elements, in
+    /// Apple order — e.g. `["⇧", "⌘", "A"]`, `["⌘", "Tab"]`. Returns `[]` for a
+    /// disabled/empty shortcut. Used to render each key as its own cap; the
+    /// joined form is `displayString`.
+    static func displaySymbols(for shortcut: String) -> [String] {
+        let cleaned = shortcut.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if cleaned.isEmpty || cleaned == "disabled" || cleaned == "none" {
+            return []
+        }
+
+        let tokens = cleaned.split(separator: "+").map(String.init)
+        guard !tokens.isEmpty else { return [] }
+
+        var symbols: [String] = []
+        for token in tokens.dropLast() {
+            switch token {
+            case "cmd",
+                 "command": symbols.append("⌘")
+            case "ctrl",
+                 "control": symbols.append("⌃")
+            case "shift": symbols.append("⇧")
+            case "opt",
+                 "option",
+                 "alt": symbols.append("⌥")
+            default: break
+            }
+        }
+
+        let key = tokens.last ?? ""
+        let keyLabel: String = switch key {
+        case "tab": "Tab"
+        case "space": "Space"
+        case "return",
+             "enter": "↩"
+        case "escape": "Esc"
+        case "left": "←"
+        case "right": "→"
+        case "up": "↑"
+        case "down": "↓"
+        default: key.uppercased()
+        }
+        symbols.append(keyLabel)
+        return symbols
+    }
+
+    static func selectedShortcutString(for action: HotkeyAction) -> String {
+        let defaults = Preferences.defaults
+        if let value = defaults.string(forKey: action.defaultsKey) {
+            return value
+        }
+        if let legacy = defaults.string(forKey: action.legacyDefaultsKey) {
+            defaults.set(legacy, forKey: action.defaultsKey)
+            return legacy
+        }
+        return action.defaultShortcut
+    }
+
+    /// Cache of parsed shortcuts keyed by action. `MainAppResponder.handle`
+    /// evaluates ~20 `matches` calls PER KEYSTROKE typed into a terminal, and
+    /// each used to read UserDefaults + re-run `parseShortcut` (lowercasing,
+    /// splitting, dictionary builds). Parsed shortcuts only change on a rebind,
+    /// so cache them and invalidate in `setShortcutString`. `.some(nil)`
+    /// distinguishes "parsed to disabled/invalid" from "not yet cached".
+    private static let shortcutCache = OSAllocatedUnfairLock<[HotkeyAction: HotkeyShortcut?]>(initialState: [:])
+
+    static func selectedShortcut(for action: HotkeyAction) -> HotkeyShortcut? {
+        shortcutCache.withLock { cache in
+            if let cached = cache[action] { return cached }
+            let parsed = parseShortcut(selectedShortcutString(for: action))
+            cache[action] = parsed
+            return parsed
+        }
+    }
+
+    @MainActor
+    static func setShortcutString(_ shortcut: String, for action: HotkeyAction) {
+        Preferences.defaults.set(shortcut, forKey: action.defaultsKey)
+        // A rebind is the only thing that changes a parsed shortcut — drop the
+        // stale cache entry so the next `matches` re-parses it once.
+        shortcutCache.withLock { $0[action] = nil }
+        // Bindings live in raw defaults keys, so SwiftUI can't see this write.
+        // Bump the observable version so views that render a binding (the
+        // shortcut hints in WelcomeView/EmptyProjectView) refresh.
+        Preferences.shared.bumpHotkeyVersion()
+        // The menu bar can't be fixed that way — a SwiftUI `.commands` tree is
+        // built once and never re-evaluated — so patch the live NSMenuItems.
+        // Skipping this leaves a cleared shortcut still firing from the menu,
+        // which beats KeyRouter to the event.
+        HotkeyMenuSync.sync()
+    }
+
+    /// Actions the user flagged to pass through to a running program.
+    ///
+    /// Cached for the same reason `shortcutCache` exists, and it matters more
+    /// here: the passthrough gate runs on EVERY keystroke, ahead of the action
+    /// branches, and matching an action costs an `eventToken` string
+    /// normalization per candidate. Scanning only the flagged actions keeps the
+    /// default configuration — nothing flagged — at one `isEmpty` check instead
+    /// of a second full 32-action scan per typed character. `nil` means "not yet
+    /// built"; an empty array is a real (and typical) answer.
+    private static let passthroughCache = OSAllocatedUnfairLock<[HotkeyAction]?>(initialState: nil)
+
+    static func passthroughActions() -> [HotkeyAction] {
+        passthroughCache.withLock { cache in
+            if let cache { return cache }
+            let flagged = HotkeyAction.allCases.filter {
+                passesThroughToPrograms(for: $0)
+            }
+            cache = flagged
+            return flagged
+        }
+    }
+
+    static func passesThroughToPrograms(for action: HotkeyAction) -> Bool {
+        let defaults = Preferences.defaults
+        if defaults.object(forKey: action.passthroughDefaultsKey) != nil {
+            return defaults.bool(forKey: action.passthroughDefaultsKey)
+        }
+        guard defaults.object(forKey: action.legacyPassthroughDefaultsKey) != nil else {
+            return false
+        }
+        let value = defaults.bool(forKey: action.legacyPassthroughDefaultsKey)
+        defaults.set(value, forKey: action.passthroughDefaultsKey)
+        return value
+    }
+
+    @MainActor
+    static func setPassesThroughToPrograms(_ enabled: Bool, for action: HotkeyAction) {
+        Preferences.defaults.set(enabled, forKey: action.passthroughDefaultsKey)
+        passthroughCache.withLock { $0 = nil }
+    }
+
+    static func isValidShortcutString(_ shortcut: String) -> Bool {
+        let cleaned = shortcut.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if cleaned.isEmpty || cleaned == "none" || cleaned == "disabled" {
+            return true
+        }
+        return parseShortcut(cleaned) != nil
+    }
+
+    static func matches(_ event: NSEvent, action: HotkeyAction) -> Bool {
+        // No `shortcut.id != "none"` check: parseShortcut already returns nil
+        // for none/disabled/empty, so a shortcut with id "none" is unreachable.
+        guard let shortcut = selectedShortcut(for: action) else { return false }
+        return shortcut.matches(event)
+    }
+
+    /// Canonical identity for a parsed shortcut — key token plus sorted
+    /// modifier flags — so `cmd+shift+d` and `shift+cmd+d` compare equal.
+    /// Returns `nil` for unparseable/disabled shortcuts (which never conflict).
+    static func conflictKey(for shortcut: String) -> String? {
+        guard let parsed = parseShortcut(shortcut) else { return nil }
+        return "\(parsed.modifiers.rawValue):\(parsed.keyToken)"
+    }
+
+    /// Given the current shortcut string for each action, returns the set of
+    /// action IDs that share a binding with at least one other action.
+    /// Disabled/invalid bindings never conflict.
+    static func conflictingActionIDs(in shortcuts: [String: String]) -> Set<String> {
+        var idsByKey: [String: [String]] = [:]
+        for (actionID, shortcut) in shortcuts {
+            guard let key = conflictKey(for: shortcut) else { continue }
+            idsByKey[key, default: []].append(actionID)
+        }
+        var conflicting: Set<String> = []
+        for (_, ids) in idsByKey where ids.count > 1 {
+            conflicting.formUnion(ids)
+        }
+        return conflicting
+    }
+}
