@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Portable unit tests of the Linux workspace helpers. Runs on macOS and Linux.
+# Drives shipped sources under linux/src — not reimplementations.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUTDIR="${TMPDIR:-/tmp}/ft-linux-test-$$"
+mkdir -p "$OUTDIR"
+CC="${CC:-cc}"
+CFLAGS="-O2 -Wall -Wextra -I $ROOT/linux/src"
+
+CORE=(
+  "$ROOT/linux/src/util.c"
+  "$ROOT/linux/src/path.c"
+  "$ROOT/linux/src/session.c"
+  "$ROOT/linux/src/split.c"
+  "$ROOT/linux/src/layout.c"
+  "$ROOT/linux/src/remote.c"
+  "$ROOT/linux/src/prefs.c"
+  "$ROOT/linux/src/command.c"
+  "$ROOT/linux/src/model.c"
+  "$ROOT/linux/src/control.c"
+  "$ROOT/linux/src/sel.c"
+  "$ROOT/linux/src/desktop.c"
+)
+
+run_test() {
+  local name="$1"
+  shift
+  local bin="$OUTDIR/$name"
+  $CC $CFLAGS -o "$bin" "$@"
+  "$bin"
+}
+
+run_test test_session "$ROOT/linux/tests/test_session.c" "$ROOT/linux/src/session.c"
+run_test test_path "$ROOT/linux/tests/test_path.c" "$ROOT/linux/src/path.c" "$ROOT/linux/src/util.c"
+run_test test_split "$ROOT/linux/tests/test_split.c" "$ROOT/linux/src/split.c" "$ROOT/linux/src/util.c"
+run_test test_layout "$ROOT/linux/tests/test_layout.c" "$ROOT/linux/src/layout.c" "$ROOT/linux/src/split.c" "$ROOT/linux/src/path.c" "$ROOT/linux/src/util.c"
+run_test test_remote "$ROOT/linux/tests/test_remote.c" "$ROOT/linux/src/remote.c" "$ROOT/linux/src/path.c" "$ROOT/linux/src/util.c"
+run_test test_prefs "$ROOT/linux/tests/test_prefs.c" "$ROOT/linux/src/prefs.c" "$ROOT/linux/src/command.c" "$ROOT/linux/src/util.c"
+run_test test_control "$ROOT/linux/tests/test_control.c" "${CORE[@]}"
+run_test test_model "$ROOT/linux/tests/test_model.c" "${CORE[@]}"
+run_test test_sel "$ROOT/linux/tests/test_sel.c" "$ROOT/linux/src/sel.c" "$ROOT/linux/src/command.c" "$ROOT/linux/src/util.c"
+run_test test_folder "$ROOT/linux/tests/test_folder.c" "${CORE[@]}"
+run_test test_desktop "$ROOT/linux/tests/test_desktop.c" "$ROOT/linux/src/desktop.c" "$ROOT/linux/src/command.c" "$ROOT/linux/src/util.c"
+
+rm -rf "$OUTDIR"
+
+DESKTOP="$ROOT/linux/share/applications/com.davidsolheim.futuraterm.desktop"
+test -f "$DESKTOP"
+grep -q '^Name=FuturaTerm$' "$DESKTOP"
+grep -q '^Exec=futuraterm$' "$DESKTOP"
+grep -q '^Categories=System;TerminalEmulator;$' "$DESKTOP"
+grep -q '^StartupWMClass=com.davidsolheim.futuraterm$' "$DESKTOP"
+test -f "$ROOT/linux/share/icons/hicolor/256x256/apps/com.davidsolheim.futuraterm.png"
+test -f "$ROOT/linux/packaging/install.sh"
+grep -q 'share/applications' "$ROOT/linux/packaging/install.sh"
+grep -q -- '--noconfirm' "$ROOT/linux/packaging/install.sh"
+grep -q -- '--needed' "$ROOT/linux/packaging/install.sh"
+grep -q 'MISE_YES' "$ROOT/linux/packaging/install.sh"
+grep -q omarchy-install-service-sunshine "$ROOT/linux/packaging/install.sh"
+grep -q 'app-dev.lizardbyte.app.Sunshine.service' "$ROOT/linux/packaging/install.sh"
+grep -q 47989 "$ROOT/linux/packaging/install.sh"
+grep -q 47998 "$ROOT/linux/packaging/install.sh"
+grep -q 'https://localhost:47990' "$ROOT/linux/packaging/install.sh"
+grep -q 'sunshine --creds' "$ROOT/linux/packaging/install.sh"
+grep -q sunshine-admin "$ROOT/linux/packaging/install.sh"
+grep -q futuraterm-sunshine-pair "$ROOT/linux/packaging/install.sh"
+! grep -q 'enable --now sunshine' "$ROOT/linux/packaging/install.sh"
+! grep -q '^DBusActivatable=' "$DESKTOP"
+! grep -E -q '(^|[[:space:]])read[[:space:]]' "$ROOT/linux/packaging/install.sh"
+
+APP="$ROOT/linux/src/app.c"
+test -f "$APP"
+grep -q 'show_palette' "$APP"
+grep -q 'Command Palette' "$APP"
+grep -q 'gtk_stack_add_titled.*[Gg]eneral' "$APP"
+grep -q 'gtk_stack_add_titled.*[Pp]rojects' "$APP"
+grep -q 'gtk_stack_add_titled.*[Aa]ppearance' "$APP"
+grep -q 'gtk_stack_add_titled.*[Qq]uick' "$APP"
+grep -q 'gtk_stack_add_titled.*[Kk]eymaps' "$APP"
+grep -q 'toggle_quick' "$APP"
+grep -F -q 'Local Folder…' "$APP"
+grep -F -q 'Remote Machine…' "$APP"
+grep -q 'teton-web/futuraterm-oss' "$ROOT/linux/README.md"
+grep -q Sunshine "$ROOT/linux/README.md"
+grep -q Moonlight "$ROOT/linux/README.md"
+HELPER="$ROOT/linux/packaging/futuraterm-sunshine-pair"
+test -f "$HELPER"
+grep -q '127.0.0.1:47990' "$HELPER"
+grep -q -- '--pin' "$HELPER"
+grep -q -- '--print-json' "$HELPER"
+! grep -E -q 'read -[ap]' "$HELPER"
+PAIR_HOME="$(mktemp -d "${TMPDIR:-/tmp}/ft-sunshine-pair.XXXXXX")"
+if HOME="$PAIR_HOME" sh "$HELPER" --pin 1234 --name test 2>/dev/null; then
+  echo "error: pair helper must fail without sunshine-admin" >&2
+  rm -rf "$PAIR_HOME"
+  exit 1
+fi
+mkdir -p "$PAIR_HOME/.config/futuraterm"
+printf 'username=u\npassword=p\n' > "$PAIR_HOME/.config/futuraterm/sunshine-admin"
+PAIR_JSON="$(HOME="$PAIR_HOME" sh "$HELPER" --pin 1234 --name dts-0 --print-json)"
+echo "$PAIR_JSON" | grep -q '"pin":"1234"'
+echo "$PAIR_JSON" | grep -q '"name":"dts-0"'
+rm -rf "$PAIR_HOME"
+grep -q 'viewDesktop' "$ROOT/linux/src/command.c"
+grep -q 'view_desktop' "$APP"
+grep -F -q 'New Folder' "$APP"
+grep -q 'gtk_menu_button_set_label.*"New Project"' "$APP"
+grep -q 'gtk_button_new_with_label("Sessions")' "$APP"
+grep -q 'gtk_window_set_title.*"Sessions"' "$APP"

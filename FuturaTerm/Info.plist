@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_DISPLAY_NAME)</string>
+	<key>CFBundleDisplayName</key>
+	<string>$(PRODUCT_DISPLAY_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>GitCommit</key>
+	<string>$(GIT_COMMIT)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+<key>NSAppleEventsUsageDescription</key>
+	<string>A process running in FuturaTerm's terminal would like to use AppleScript.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>A process running in FuturaTerm's terminal would like to use Bluetooth.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>A process running in FuturaTerm's terminal would like to access your calendar.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>A process running in FuturaTerm's terminal would like to use the camera.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>A process running in FuturaTerm's terminal would like to access your contacts.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>A process running in FuturaTerm's terminal would like to access the local network.</string>
+	<key>NSLocationUsageDescription</key>
+	<string>A process running in FuturaTerm's terminal would like to access your location information.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>A process running in FuturaTerm's terminal would like to use your microphone.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>A process running in FuturaTerm's terminal would like to access motion data.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>A process running in FuturaTerm's terminal would like to access your photo library.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>A process running in FuturaTerm's terminal would like to access your reminders.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>A process running in FuturaTerm's terminal would like to use speech recognition.</string>
+	<key>NSSystemAdministrationUsageDescription</key>
+	<string>A process running in FuturaTerm's terminal requires elevated privileges.</string>
+	<key>SUPublicEDKey</key>
+	<string>$(SPARKLE_ED_PUBLIC_KEY)</string>
+	<key>SUFeedURL</key>
+	<string>https://futuraterm.com/appcast.xml</string>
+	<key>SUEnableInstallerLauncherService</key>
+	<false/>
+	<key>SUEnableAutomaticChecks</key>
+	<false/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
+	<key>SUAllowsAutomaticUpdates</key>
+	<false/>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.davidsolheim.futuraterm.open</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>futuraterm</string>
+			</array>
+		</dict>
+	</array>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.davidsolheim.futuraterm.pane-id</string>
+			<key>UTTypeDescription</key>
+			<string>FuturaTerm Pane Identifier</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict/>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.davidsolheim.futuraterm.tab-move</string>
+			<key>UTTypeDescription</key>
+			<string>FuturaTerm Tab Move</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict/>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.davidsolheim.futuraterm.project-move</string>
+			<key>UTTypeDescription</key>
+			<string>FuturaTerm Project Move</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict/>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.davidsolheim.futuraterm.folder-move</string>
+			<key>UTTypeDescription</key>
+			<string>FuturaTerm Folder Move</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict/>
+		</dict>
+	</array>
+</dict>
+</plist>
