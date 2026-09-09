@@ -1,0 +1,97 @@
+# Lint every first-party Swift target, not just the app: CLI/ ships a real
+# binary and FuturaTermTests/ is enforced-convention code too. (Previously only
+# the app sources were scanned, silently exempting both.)
+included:
+  - FuturaTerm
+  - CLI
+  - FuturaTermTests
+
+excluded:
+  - build
+  - GhosttyKit
+
+disabled_rules:
+  - todo
+  - nesting
+  - type_body_length
+  - file_length
+  - function_body_length
+  - opening_brace
+  - closure_parameter_position
+  - cyclomatic_complexity
+  # Trailing commas are owned by SwiftFormat's `trailingCommas` rule, which
+  # (unlike SwiftLint's `trailing_comma`) correctly omits the comma on
+  # single-element multiline collections. Running both fought each other on
+  # `[Foo(\n…\n)]` literals — one tool's fix was the other's violation. One
+  # tool per concern: SwiftFormat wins here.
+  - trailing_comma
+  # `String(decoding:as:UTF8.self)` is the modern, non-optional, LOSSLESS
+  # conversion this codebase deliberately uses (KERN_PROCARGS2 argv parsing in
+  # ProcessInspector must not drop non-UTF-8 bytes — see §5.8; CLI JSON output
+  # is already valid UTF-8). This rule pushes toward the failable
+  # `String(bytes:encoding:)`, which would reintroduce the byte-dropping the
+  # lossless form exists to avoid. Off project-wide.
+  - optional_data_string_conversion
+
+opt_in_rules:
+  - closure_end_indentation
+  - closure_spacing
+  - collection_alignment
+  - contains_over_filter_count
+  - contains_over_filter_is_empty
+  - contains_over_first_not_nil
+  - contains_over_range_nil_comparison
+  - empty_collection_literal
+  - empty_count
+  - empty_string
+  - enum_case_associated_values_count
+  - explicit_init
+  - fatal_error_message
+  - first_where
+  - flatmap_over_map_reduce
+  - force_unwrapping
+  - identical_operands
+  - implicit_return
+  - joined_default_parameter
+  - last_where
+  - legacy_multiple
+  - lower_acl_than_parent
+  - modifier_order
+  - operator_usage_whitespace
+  - overridden_super_call
+  - prefer_self_type_over_type_of_self
+  - prefer_zero_over_explicit_init
+  - private_action
+  - redundant_nil_coalescing
+  - redundant_type_annotation
+  - sorted_first_last
+  - toggle_bool
+  - unneeded_parentheses_in_closure_argument
+  - vertical_whitespace_closing_braces
+  - vertical_whitespace_opening_braces
+  - yoda_condition
+
+line_length:
+  warning: 140
+  error: 200
+  ignores_urls: true
+  ignores_function_declarations: false
+  ignores_comments: true
+
+type_name:
+  min_length: 2
+  max_length: 60
+
+identifier_name:
+  min_length: 1
+  max_length: 60
+  allowed_symbols: ["_"]
+  # `H`/`V` are the documented TreeBuilder split-tree DSL (H(pane("a"), …)) —
+  # single-uppercase by design for terse test trees. Allow them by name rather
+  # than lower-casing a deliberately-compact DSL.
+  excluded:
+    - H
+    - V
+
+vertical_whitespace:
+  max_empty_lines: 1
