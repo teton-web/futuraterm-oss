@@ -1,0 +1,512 @@
+import Foundation
+
+/// Wire types for the FuturaTerm control socket — the IPC contract between the
+/// running app (`ControlSocketServer` + `ControlHandler`) and the bundled
+/// `futuraterm` CLI. This file is compiled into BOTH targets (app and CLI) so
+/// the codec can never drift; it must stay free of app-only dependencies
+/// (AppKit, FileStorage, AppState).
+///
+/// Framing: one request per connection. The client writes a single
+/// newline-terminated JSON `ControlRequest` line and half-closes its write
+/// end; the server replies with a single newline-terminated JSON
+/// `ControlResponse` line and closes. Newline-delimited JSON keeps the
+/// protocol debuggable with `nc`/`socat` and leaves room for streaming later.
+enum ControlProtocol {
+    /// Bumped only for breaking changes; additive fields are always safe
+    /// (both sides decode with optional fields).
+    static let version = 1
+
+    /// Bundled control CLI command name (`PRODUCT_NAME` / ArgumentParser).
+    static let cliCommandName = "futuraterm"
+
+    /// Socket file inside the app-support directory (per build flavor:
+    /// `FuturaTerm/` vs `FuturaTerm Debug/`).
+    static let socketFilename = "control.sock"
+
+    /// Exported by the app into every spawned shell. A *hint*, not a pin:
+    /// clients fall back to the well-known per-flavor paths when the hinted
+    /// socket doesn't answer (a pinned stale path otherwise breaks every
+    /// shell spawned before an app restart).
+    static let socketEnvVar = "FUTURATERM_SOCKET"
+
+    /// Injected per-pane so `futuraterm` invoked inside a pane can target the
+    /// pane it runs in. Session names are restart-stable (persisted verbatim
+    /// in the workspace snapshot), unlike pane UUIDs.
+    static let sessionEnvVar = "FUTURATERM_SESSION"
+
+    /// Non-empty socket hints from `FUTURATERM_SOCKET`.
+    static func socketHints(from environment: [String: String]) -> [String] {
+        if let hinted = environment[socketEnvVar], !hinted.isEmpty {
+            return [hinted]
+        }
+        return []
+    }
+
+    /// Session name from `FUTURATERM_SESSION`. Empty values are skipped.
+    static func sessionHint(from environment: [String: String]) -> String? {
+        if let hinted = environment[sessionEnvVar], !hinted.isEmpty { return hinted }
+        return nil
+    }
+
+    /// Discovery order: `--socket` is a hard pin (tried alone); otherwise
+    /// `FUTURATERM_SOCKET` then the well-known per-flavor
+    /// App Support paths. Hints are not pins — a stale exported path falls
+    /// through instead of bricking the CLI in that shell.
+    static func socketCandidatePaths(
+        override: String? = nil,
+        environment: [String: String],
+        appSupportDirectory: URL
+    ) -> [String] {
+        if let override, !override.isEmpty {
+            return [override]
+        }
+        var paths: [String] = []
+        var seen = Set<String>()
+        func append(_ path: String) {
+            if seen.insert(path).inserted { paths.append(path) }
+        }
+        for hinted in socketHints(from: environment) {
+            append(hinted)
+        }
+        for flavor in ["FuturaTerm", "FuturaTerm Debug"] {
+            append(
+                appSupportDirectory
+                    .appendingPathComponent(flavor, isDirectory: true)
+                    .appendingPathComponent(socketFilename)
+                    .path
+            )
+        }
+        return paths
+    }
+
+    /// Client `SO_RCVTIMEO` in seconds. Default 10s is enough for ordinary
+    /// commands and the default 5s dump quiet wait. `--timeout-ms` can be up
+    /// to 30s, so stretch past that wait plus slack or the CLI reports a
+    /// connection timeout instead of the dump payload (`ok` + `quietTimedOut`).
+    static let defaultReceiveTimeoutSeconds = 10
+    static let receiveTimeoutSlackSeconds = 2
+
+    static func receiveTimeoutSeconds(timeoutMs: Int?) -> Int {
+        guard let timeoutMs else { return defaultReceiveTimeoutSeconds }
+        let waitSeconds = (max(timeoutMs, 0) + 999) / 1000
+        return max(defaultReceiveTimeoutSeconds, waitSeconds + receiveTimeoutSlackSeconds)
+    }
+}
+
+// MARK: - Request
+
+struct ControlRequest: Codable {
+    var v: Int
+    /// Client-generated; echoed in the response.
+    var id: String
+    /// Namespaced verb, e.g. `status`, `project.list`, `pane.list`.
+    var command: String
+    var args: ControlArgs?
+
+    init(command: String, args: ControlArgs? = nil) {
+        v = ControlProtocol.version
+        id = UUID().uuidString
+        self.command = command
+        self.args = args
+    }
+}
+
+/// Flat bag of every argument any command accepts (all optional). A single
+/// struct instead of per-command payloads keeps the codec trivial and makes
+/// unknown/extra fields harmless across versions — the same shape Zentty's
+/// battle-tested `AgentIPCRequest` uses.
+struct ControlArgs: Codable, Equatable {
+    /// Project selector: name, UUID, or 1-based index as rendered by
+    /// `project list`.
+    var project: String?
+    /// Tab selector: title, UUID, or 1-based index (`tab:3` or `3`).
+    var tab: String?
+    /// Pane selector: UUID or 1-based index within its tab.
+    var pane: String?
+    /// zmx session name (`futuraterm-<slug>-<hex12>`) — the restart-stable pane
+    /// address.
+    var session: String?
+    /// Filesystem path (`project.create`, `project.open`).
+    var path: String?
+    /// Display name (`project.create`, `project.open` — on open, only when creating).
+    var name: String?
+    /// Also select/activate what was created (`project.create`).
+    var select: Bool?
+    /// Command to run: spawned via `initial_input` in new panes
+    /// (`tab.new`, `pane.split`, `grid`, `project.open`), typed into the live
+    /// shell for `pane.run`.
+    var run: String?
+    /// Reuse a matching live pane for `project.open --run`. `false` is
+    /// `--no-reuse` (always create a tab). Nil / omitted defaults to reuse on.
+    var reuse: Bool?
+    /// Direction, with a per-command vocabulary: `right`/`down`/`auto` for
+    /// `pane.split`, `left`/`down`/`up`/`right` for `pane.focus` (where it
+    /// makes the resolved pane the origin and focuses its neighbour).
+    var direction: String?
+    /// Skip the busy-confirmation and destructive-plan guards
+    /// (`tab.close`, `pane.close`, `layout.apply`).
+    var force: Bool?
+    /// Grid shape (`grid`); also the target grid for the debug-only
+    /// `pane.resize` in-place surface resize.
+    var rows: Int?
+    var cols: Int?
+    /// Include the full scrollback, not just the viewport (`pane.dump`).
+    var scrollback: Bool?
+    /// Wait until the dump text is unchanged for this many milliseconds
+    /// (`pane.dump`). Nil is today's one-shot snapshot. Clamped 50…2000.
+    var quietMs: Int?
+    /// Cap for `--quiet-ms` (`pane.dump`). Default 5000 when `quietMs` is set;
+    /// ignored otherwise. Clamped 100…30000.
+    var timeoutMs: Int?
+    /// Split axis to resize (`pane.resize-split`): `horizontal` or `vertical`.
+    var axis: String?
+    /// Absolute split ratio in 0.15…0.85 (`pane.resize-split`).
+    var ratio: Double?
+    /// Key chord to send (`pane.key`): a `HotkeyRegistry`-grammar string such as
+    /// `ctrl+c`, `escape`, `up`, or `ctrl+\` — delivered through libghostty's
+    /// key-encoding path, not the text-paste path `run` uses.
+    var key: String?
+    /// Drop zone for the debug-only `pane.move`: `left`/`right`/`top`/`bottom`.
+    var zone: String?
+    /// Destination pane selector for `pane.move` (same tab); nil = the
+    /// workspace edge (a root-level move).
+    var dest: String?
+    /// Destination slot for `tab.move`: the tab's FINAL 1-based position in
+    /// `tab list` order, not a drag-and-drop insertion offset.
+    var slot: Int?
+    /// 1-based viewport cell for `pane.click` and `pane.select`. Distinct from
+    /// `cols`/`rows`, which are grid *size* (`grid`, debug `pane.resize`).
+    var cellCol: Int?
+    var cellRow: Int?
+    /// Inclusive end cell for a `pane.select` box (`endCol`/`endRow`). Defaults
+    /// to `cellCol`/`cellRow` when omitted.
+    var endCol: Int?
+    var endRow: Int?
+    /// UTF-16 viewport range for `pane.select` (`selectText`) and reported by
+    /// `pane.selection`. Same unit both ways so GET then SET is a round-trip.
+    var start: Int?
+    var length: Int?
+    /// 1-based viewport line for `pane.select` (whole line including newline).
+    var line: Int?
+    /// Menu number for `pane.choose` (the parser index, not a 1-based dump line).
+    var choice: Int?
+
+    init(
+        project: String? = nil,
+        tab: String? = nil,
+        pane: String? = nil,
+        session: String? = nil,
+        path: String? = nil,
+        name: String? = nil,
+        select: Bool? = nil,
+        run: String? = nil,
+        reuse: Bool? = nil,
+        direction: String? = nil,
+        force: Bool? = nil,
+        rows: Int? = nil,
+        cols: Int? = nil,
+        scrollback: Bool? = nil,
+        quietMs: Int? = nil,
+        timeoutMs: Int? = nil,
+        axis: String? = nil,
+        ratio: Double? = nil,
+        key: String? = nil,
+        zone: String? = nil,
+        dest: String? = nil,
+        slot: Int? = nil,
+        cellCol: Int? = nil,
+        cellRow: Int? = nil,
+        endCol: Int? = nil,
+        endRow: Int? = nil,
+        start: Int? = nil,
+        length: Int? = nil,
+        line: Int? = nil,
+        choice: Int? = nil
+    ) {
+        self.project = project
+        self.tab = tab
+        self.pane = pane
+        self.session = session
+        self.path = path
+        self.name = name
+        self.select = select
+        self.run = run
+        self.reuse = reuse
+        self.direction = direction
+        self.force = force
+        self.rows = rows
+        self.cols = cols
+        self.scrollback = scrollback
+        self.quietMs = quietMs
+        self.timeoutMs = timeoutMs
+        self.axis = axis
+        self.ratio = ratio
+        self.key = key
+        self.zone = zone
+        self.dest = dest
+        self.slot = slot
+        self.cellCol = cellCol
+        self.cellRow = cellRow
+        self.endCol = endCol
+        self.endRow = endRow
+        self.start = start
+        self.length = length
+        self.line = line
+        self.choice = choice
+    }
+}
+
+// MARK: - Response
+
+struct ControlResponse: Codable {
+    var v: Int
+    var id: String
+    var ok: Bool
+    var data: ControlData?
+    var error: ControlError?
+
+    static func success(id: String, data: ControlData? = nil) -> ControlResponse {
+        ControlResponse(v: ControlProtocol.version, id: id, ok: true, data: data, error: nil)
+    }
+
+    static func failure(id: String, error: ControlError) -> ControlResponse {
+        ControlResponse(v: ControlProtocol.version, id: id, ok: false, data: nil, error: error)
+    }
+}
+
+struct ControlError: Codable, Equatable, Error {
+    var code: ControlErrorCode
+    var message: String
+    /// Optional recovery hint shown to humans, e.g. "launch FuturaTerm first".
+    var action: String?
+}
+
+enum ControlErrorCode: String, Codable {
+    /// The socket is up but AppState hasn't attached yet (app mid-launch).
+    case starting
+    case unknownCommand = "unknown_command"
+    case badRequest = "bad_request"
+    case notFound = "not_found"
+    case ambiguous
+    /// The operation was staged for user confirmation instead of executing
+    /// (e.g. closing a busy tab without `--force`).
+    case busy
+    /// The target pane exists but its terminal surface hasn't been created.
+    case noSurface = "no_surface"
+    case internalError = "internal"
+}
+
+/// Union-of-optionals result payload (one struct for every command, like
+/// Zentty's `AgentIPCResponseResult`): each command populates exactly the
+/// fields it owns, and old clients ignore fields they don't know.
+struct ControlData: Codable {
+    var status: ControlStatusInfo?
+    var projects: [ControlProjectInfo]?
+    var tabs: [ControlTabInfo]?
+    var panes: [ControlPaneInfo]?
+    var sessions: [ControlSessionInfo]?
+    /// Read-only terminal-core snapshot (`pane.inspect`).
+    var inspect: ControlPaneInspect?
+    /// Terminal cell text (`pane.dump`).
+    var dump: ControlPaneDump?
+    /// Live libghostty selection (`pane.selection`).
+    var selection: ControlPaneSelection?
+    /// Numbered TUI options from the viewport (`pane.choices`).
+    var choices: [ControlPaneChoice]?
+
+    init(
+        status: ControlStatusInfo? = nil,
+        projects: [ControlProjectInfo]? = nil,
+        tabs: [ControlTabInfo]? = nil,
+        panes: [ControlPaneInfo]? = nil,
+        sessions: [ControlSessionInfo]? = nil,
+        inspect: ControlPaneInspect? = nil,
+        dump: ControlPaneDump? = nil,
+        selection: ControlPaneSelection? = nil,
+        choices: [ControlPaneChoice]? = nil
+    ) {
+        self.status = status
+        self.projects = projects
+        self.tabs = tabs
+        self.panes = panes
+        self.sessions = sessions
+        self.inspect = inspect
+        self.dump = dump
+        self.selection = selection
+        self.choices = choices
+    }
+}
+
+/// One numbered TUI row (`pane.choices`). `index` is the menu number; `line`
+/// / `column` are 1-based dump coordinates matching `NumberedChoiceParser`.
+struct ControlPaneChoice: Codable, Equatable {
+    var index: Int
+    var label: String
+    var line: Int
+    var column: Int
+    var selected: Bool
+}
+
+struct ControlStatusInfo: Codable, Equatable {
+    var version: String
+    var pid: Int32
+    var activeProject: String?
+    var activeProjectID: String?
+}
+
+struct ControlProjectInfo: Codable, Equatable {
+    var id: String
+    var name: String
+    var path: String
+    var active: Bool
+    /// Whether a live workspace exists for the project this launch.
+    var loaded: Bool
+    var tabCount: Int?
+}
+
+struct ControlTabInfo: Codable, Equatable {
+    /// 1-based position in the sidebar, rendered as `tab:N`.
+    var index: Int
+    var id: String
+    var title: String
+    var active: Bool
+    var paneCount: Int
+}
+
+struct ControlPaneInfo: Codable, Equatable {
+    /// 1-based position within its tab (split-tree order), rendered `pane:N`.
+    var index: Int
+    var id: String
+    /// zmx session name — the stable address for scripting.
+    var session: String
+    var tabIndex: Int
+    var tabID: String
+    var title: String
+    /// Live foreground process name, if the poll has resolved one.
+    var process: String?
+    var cwd: String?
+    var focused: Bool
+    /// The tab activity indicator's underlying state: `idle`, `running`, or
+    /// `done` (finished while unfocused — the indicator scripts want to poll
+    /// for). Optional per the additive-field convention above — nil when
+    /// decoded from an older server that predates this field.
+    var state: String?
+}
+
+struct ControlSessionInfo: Codable, Equatable {
+    var name: String
+    /// Attached client count from `zmx ls`; nil when the daemon reported the
+    /// session in a state the parser couldn't count (err/status line).
+    var clients: Int?
+    /// Daemon leader pid, when resolved.
+    var leaderPID: Int32?
+    /// The live pane currently bound to this session, if any (a session with
+    /// no pane is an orphan awaiting reap or reattach).
+    var paneID: String?
+}
+
+/// Read-only snapshot of a pane's terminal core (`pane.inspect`). Every field
+/// is a live libghostty read or a value derived from one — nothing persisted.
+/// The point is one-command observability for resize/reflow/scrollback bugs
+/// (#112): the scrollback totals here were the whole diagnostic signal.
+struct ControlPaneInspect: Codable, Equatable {
+    var id: String
+    var session: String
+    /// Terminal grid, from `ghostty_surface_size`.
+    var cols: Int
+    var rows: Int
+    /// Cell size in backing pixels.
+    var cellWidthPx: Int
+    var cellHeightPx: Int
+    /// Surface size in backing pixels.
+    var widthPx: Int
+    var heightPx: Int
+    /// Scrollback rows (`total`), the viewport's top row within them
+    /// (`offset`), and the viewport height in rows (`len`) — from the cached
+    /// `GHOSTTY_ACTION_SCROLLBAR` snapshot. nil before the first scrollbar
+    /// update (a never-scrolled, never-resized surface).
+    var scrollbackTotal: UInt64?
+    var scrollbackOffset: UInt64?
+    var scrollbackLen: UInt64?
+    /// Heuristic: true when there's no scrollback to speak of (`total <= len`),
+    /// which is the alt-screen / fresh-prompt condition the scroll code uses.
+    /// libghostty exposes no direct alt-screen query, so this is derived, and
+    /// nil when no scrollbar snapshot has arrived yet.
+    var altScreen: Bool?
+    /// Backing scale factor of the pane's window (points→pixels).
+    var contentScale: Double?
+    /// Foreground pid on the pty (`ghostty_surface_foreground_pid`) and its
+    /// argv (KERN_PROCARGS2), nil when idle-at-prompt/unreadable/remote.
+    var foregroundPID: Int32?
+    var foregroundArgv: [String]?
+    /// libghostty liveness flags.
+    var processExited: Bool
+    var needsConfirmQuit: Bool
+}
+
+/// Terminal cell text read out of the core (`pane.dump`) via
+/// `ghostty_surface_read_text`.
+struct ControlPaneDump: Codable, Equatable {
+    var id: String
+    var session: String
+    /// Whether `text` includes the full scrollback (`--scrollback`) or just
+    /// the visible viewport.
+    var scrollback: Bool
+    /// UTF-8 byte length of `text` (handy for scripts before they slurp it).
+    var bytes: Int
+    var text: String
+    /// Set when `quietMs` was requested: `true` if the wait hit `timeoutMs`
+    /// before the viewport stayed still. Omitted on one-shot dumps so old
+    /// payloads still decode.
+    var quietTimedOut: Bool?
+}
+
+/// Live selection for `pane.selection`. `start`/`length` are UTF-16 offsets
+/// in the **visible viewport** (the same unit `pane.select --start/--length`
+/// and `selectText` use), not libghostty screen-buffer offsets. Empty or
+/// scrollback-only selection is `hasSelection: false`, `text: ""`, zeros.
+struct ControlPaneSelection: Codable, Equatable {
+    var session: String
+    var hasSelection: Bool
+    var text: String
+    var start: Int
+    var length: Int
+}
+
+// MARK: - Codec
+
+extension ControlProtocol {
+    static func encode(_ request: ControlRequest) throws -> Data {
+        var data = try JSONEncoder().encode(request)
+        data.append(0x0A)
+        return data
+    }
+
+    static func encode(_ response: ControlResponse) -> Data {
+        // A response that fails to encode is a programming error; fall back to
+        // a hand-built internal error so the client always gets valid JSON.
+        if var data = try? JSONEncoder().encode(response) {
+            data.append(0x0A)
+            return data
+        }
+        let fallback = #"{"v":1,"id":"","ok":false,"error":{"code":"internal","message":"response encoding failed"}}"#
+        return Data((fallback + "\n").utf8)
+    }
+
+    static func decodeRequest(_ data: Data) throws -> ControlRequest {
+        try JSONDecoder().decode(ControlRequest.self, from: trimmed(data))
+    }
+
+    static func decodeResponse(_ data: Data) throws -> ControlResponse {
+        try JSONDecoder().decode(ControlResponse.self, from: trimmed(data))
+    }
+
+    /// Strip the trailing newline (and any stray whitespace) before decoding.
+    private static func trimmed(_ data: Data) -> Data {
+        var slice = data[...]
+        while let last = slice.last, last == 0x0A || last == 0x0D || last == 0x20 {
+            slice = slice.dropLast()
+        }
+        return Data(slice)
+    }
+}

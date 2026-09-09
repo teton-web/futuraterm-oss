@@ -1,0 +1,705 @@
+import AppKit
+import Foundation
+import GhosttyKit
+import os
+
+private let logger = Logger(subsystem: appBundleID, category: "GhosttyApp")
+
+/// Manages the libghostty application lifecycle: init, config, tick loop, color queries.
+@MainActor @Observable
+final class GhosttyApp {
+    static let shared = GhosttyApp()
+
+    @ObservationIgnored
+    private(set) var app: ghostty_app_t?
+    private(set) var config: ghostty_config_t?
+    private(set) var configVersion = 0
+    @ObservationIgnored
+    private var tickTimer: Timer?
+    @ObservationIgnored
+    private let callbacks = GhosttyCallbacks()
+    @ObservationIgnored
+    private var resourcesDir: String?
+    @ObservationIgnored
+    private var appearanceObserver: NSKeyValueObservation?
+    @ObservationIgnored
+    private var systemAppearanceObserver: (any NSObjectProtocol)?
+    /// The OS-level light/dark scheme. Split resolution must key off this —
+    /// never an `effectiveAppearance`, which our own `.preferredColorScheme`
+    /// pins, latching the theme after one system switch (issue #144).
+    private(set) var systemScheme: ThemeResolver.Scheme = .light
+    /// Chrome colors as libghostty resolved them for a live surface — the
+    /// active `theme = light:X,dark:Y` side already applied. Populated from
+    /// `GHOSTTY_ACTION_CONFIG_CHANGE` (see `adoptResolvedColors`) and preferred
+    /// over the app-global config getters, which always collapse a split to its
+    /// light side. Nil until the first surface reports its config.
+    @ObservationIgnored
+    private var resolvedColors: ResolvedColors?
+    /// Opt-in window-wide background inferred from a lone visible terminal
+    /// pane. Split-pane colors stay local to their panes, so nil also means
+    /// window chrome continues to use the configured Ghostty theme.
+    private(set) var adaptiveBackgroundColor: NSColor?
+    /// Memoized `resolvedThemeColors()`, keyed on the `configVersion` it was
+    /// computed for. Without this, every color accessor re-reads THREE files
+    /// (defaults + user config + theme) and re-runs `ThemeResolver` — and
+    /// `FuturaTermTheme` fans one SwiftUI render into a dozen accessor calls, so a
+    /// chrome frame did a dozen disk reads whenever `resolvedColors` was nil
+    /// (before the first CONFIG_CHANGE, and after every appearance flip). The
+    /// result is fully determined by `configVersion` (which bumps on reload and
+    /// appearance change), so caching on it is safe. `.some(nil)` distinguishes
+    /// "computed, no split theme" from "not yet computed".
+    @ObservationIgnored
+    private var themeColorsCache: (version: Int, colors: ThemeResolver.Colors?)?
+
+    private init() {
+        // ghostty_init captures `environ` as a pointer+length slice for the
+        // life of the process (surface spawns read it; no C API re-syncs it).
+        // Any setenv/unsetenv after that capture leaves the slice dangling —
+        // observed as a startup crash in the spawn path. App-level env
+        // mutation lives in EnvironmentSetup, which must already have run;
+        // resolveResources() below also setenvs, deliberately before the
+        // ghostty_init call on this same path.
+        precondition(
+            EnvironmentSetup.didRun,
+            "EnvironmentSetup.runOnce() must precede ghostty_init — environ is captured here"
+        )
+        systemScheme = Self.readSystemScheme()
+        resolveResources()
+        guard ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv) == GHOSTTY_SUCCESS else {
+            logger.error("ghostty_init failed")
+            return
+        }
+        let (cfgOpt, _) = loadConfig()
+        guard let cfg = cfgOpt else {
+            logger.error("ghostty_config_new failed")
+            return
+        }
+
+        var rt = ghostty_runtime_config_s()
+        // No `rt.userdata`: the app-target callbacks below reach `GhosttyApp
+        // .shared` directly (safe — the singleton outlives the app and these
+        // fire only after init). The per-surface callbacks recover their owner
+        // from the SURFACE userdata instead (see `surface(from:)`), so the
+        // app-level userdata pointer was dead weight.
+        rt.supports_selection_clipboard = true
+        rt.wakeup_cb = { _ in GhosttyApp.shared.callbacks.wakeup() }
+        rt.action_cb = { _, target, action in GhosttyApp.shared.callbacks.action(target: target, action: action) }
+        rt.read_clipboard_cb = { ud, _, state, mimes, mimesLen, list in
+            GhosttyApp.shared.callbacks.readClipboard(
+                ud: ud, state: state, mimes: mimes, mimesLen: mimesLen, list: list
+            )
+        }
+        rt.confirm_read_clipboard_cb = { ud, confirm, state, _ in
+            GhosttyApp.shared.callbacks.confirmReadClipboard(ud: ud, confirm: confirm, state: state)
+        }
+        rt.write_clipboard_cb = { _, loc, content, len, confirm in
+            GhosttyApp.shared.callbacks.writeClipboard(
+                content: content, len: UInt(len), location: loc, confirm: confirm
+            )
+        }
+        rt.close_surface_cb = { ud, _ in GhosttyApp.shared.callbacks.closeSurface(ud: ud) }
+
+        guard let createdApp = ghostty_app_new(&rt, cfg) else {
+            logger.error("ghostty_app_new failed")
+            ghostty_config_free(cfg)
+            return
+        }
+        app = createdApp
+        config = cfg
+
+        // Ticking is event-driven: libghostty's `wakeup_cb` fires whenever the
+        // core needs `ghostty_app_tick` (GhosttyCallbacks.wakeup schedules it
+        // on the main queue) — the same model as upstream Ghostty.app. A slow
+        // 1s timer remains as a safety net so a missed wakeup degrades to one
+        // extra tick per second instead of a wedged UI; it replaces a 120Hz
+        // timer that burned 120 wakeups/sec even while the app was hidden.
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
+        }
+        timer.tolerance = 0.5
+        RunLoop.main.add(timer, forMode: .common)
+        tickTimer = timer
+
+        // React to system light/dark switches. Two triggers: the KVO goes
+        // silent once our own preferredColorScheme pins the app's appearance
+        // (issue #144); the distributed notification always fires.
+        //
+        // Deferred off the init stack: observing `NSApp.effectiveAppearance`
+        // can re-enter `GhosttyApp.shared` mid-init, deadlocking its
+        // dispatch_once.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            appearanceObserver = NSApp.observe(\.effectiveAppearance, options: [.new]) { _, _ in
+                MainActor.assumeIsolated { GhosttyApp.shared.systemAppearanceMayHaveChanged() }
+            }
+            systemAppearanceObserver = DistributedNotificationCenter.default().addObserver(
+                forName: Notification.Name("AppleInterfaceThemeChangedNotification"),
+                object: nil,
+                queue: .main
+            ) { _ in
+                MainActor.assumeIsolated { GhosttyApp.shared.systemAppearanceMayHaveChanged() }
+            }
+        }
+    }
+
+    /// Re-resolve everything appearance-derived against the new system scheme.
+    /// Deduped — an ordinary (unpinned) switch fires both observers.
+    private func systemAppearanceMayHaveChanged() {
+        let scheme = Self.readSystemScheme()
+        guard scheme != systemScheme else { return }
+        systemScheme = scheme
+        logger.info("system appearance changed: \(scheme == .dark ? "dark" : "light", privacy: .public)")
+
+        // A window held by preferredColorScheme never delivers
+        // viewDidChangeEffectiveAppearance — push the scheme to surfaces
+        // directly; each push re-emits CONFIG_CHANGE with the new side.
+        for view in GhosttyTerminalNSView.allLiveViews() {
+            view.syncColorScheme()
+        }
+        // Stale until those re-emits land (and no surface may be alive to
+        // emit) — fall back to the theme file meanwhile.
+        resolvedColors = nil
+
+        configVersion += 1
+        NotificationCenter.default.post(name: .futuraTermConfigDidChange, object: nil)
+    }
+
+    /// Inputs for `ThemeResolver.systemScheme` (the tested decision logic).
+    /// CFPreferences because `AppleInterfaceStyle` is OS global-domain state,
+    /// not app state.
+    private static func readSystemScheme() -> ThemeResolver.Scheme {
+        let style = CFPreferencesCopyAppValue(
+            "AppleInterfaceStyle" as CFString,
+            kCFPreferencesAnyApplication
+        ) as? String
+        return ThemeResolver.systemScheme(
+            appHasAppearanceOverride: NSApp.appearance != nil,
+            effectiveAppearanceIsDark: NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua,
+            globalInterfaceStyle: style
+        )
+    }
+
+    func tick() {
+        guard let app else { return }
+        ghostty_app_tick(app)
+    }
+
+    /// Propagate application-level focus to libghostty. When the app is not the
+    /// active app, surfaces stop blinking the cursor and running idle
+    /// animations — redraws that otherwise keep every surface's renderer busy.
+    /// Visible surfaces still draw real terminal output; this only throttles
+    /// app-focus-driven repaints (see also per-surface occlusion).
+    func setAppFocus(_ focused: Bool) {
+        guard let app else { return }
+        ghostty_app_set_focus(app, focused)
+    }
+
+    // MARK: - Config
+
+    /// Result of a config (re)load. `missingUserConfigPaths` is populated when
+    /// the user pointed to paths that don't exist on disk — useful to
+    /// surface from the Settings reload button. `diagnostics` are libghostty's
+    /// parse warnings/errors (unknown keys, bad values, etc.). Both are
+    /// empty on a clean reload.
+    struct ReloadResult {
+        var missingUserConfigPaths: [String] = []
+        var inaccessibleConfigBookmarkPaths: [String] = []
+        var diagnostics: [String]
+    }
+
+    @discardableResult
+    func reloadConfig() -> ReloadResult {
+        guard let app else { return ReloadResult(diagnostics: []) }
+        let (newConfig, result) = loadConfig()
+        guard let newConfig else { return result }
+        ghostty_app_update_config(app, newConfig)
+        // Also update each existing surface so changes take effect immediately
+        for view in GhosttyTerminalNSView.allLiveViews() {
+            if let surface = view.surface {
+                ghostty_surface_update_config(surface, newConfig)
+            }
+        }
+        if let old = config { ghostty_config_free(old) }
+        config = newConfig
+        configVersion += 1
+        NotificationCenter.default.post(name: .futuraTermConfigDidChange, object: nil)
+        return result
+    }
+
+    /// Re-apply the *current* config object to the app and every live surface,
+    /// without re-reading any file from disk.
+    ///
+    /// libghostty emits a soft `GHOSTTY_ACTION_RELOAD_CONFIG` whenever a
+    /// surface's conditional state changes — most importantly when we call
+    /// `ghostty_surface_set_color_scheme`, which flips the `theme =
+    /// light:X,dark:Y` split's resolved side. The surface mutates its
+    /// conditional state but defers re-deriving its colors until the apprt
+    /// hands the config back. If we ignore the action, the surface keeps
+    /// rendering the side it resolved at creation (libghostty defaults a new
+    /// surface's conditional state to `.light`), so a new dark-mode pane shows
+    /// light-side foreground until something else reloads the config. Feeding
+    /// the existing config back here re-derives the colors against the updated
+    /// conditional state. Each `ghostty_surface_update_config` also makes the
+    /// surface re-emit `GHOSTTY_ACTION_CONFIG_CHANGE` with its resolved config,
+    /// which is how FuturaTerm's chrome adopts the new split side (see
+    /// `adoptResolvedColors`). (Companion to issue #38.)
+    func softReloadConfig() {
+        guard let app, let config else { return }
+        ghostty_app_update_config(app, config)
+        for view in GhosttyTerminalNSView.allLiveViews() {
+            if let surface = view.surface {
+                ghostty_surface_update_config(surface, config)
+            }
+        }
+    }
+
+    /// Reload and surface any user-visible errors (missing file, parse errors)
+    /// as a modal alert. Used by both the Settings reload button and the
+    /// rebindable "Reload Ghostty config" hotkey.
+    ///
+    /// Returns whether the reload was clean. A successful reload is invisible
+    /// unless the config happened to change a color, so the command path uses
+    /// this to confirm with a toast; Settings ignores it (its own window is
+    /// front, and an alert already covers the failure case).
+    @discardableResult
+    func reloadAndReport() -> Bool {
+        let result = reloadConfig()
+        var lines: [String] = []
+        for missing in result.missingUserConfigPaths {
+            lines.append("File not found: \(missing)")
+        }
+        for path in result.inaccessibleConfigBookmarkPaths {
+            lines.append("Needs access again: \(path)")
+        }
+        if !result.diagnostics.isEmpty {
+            lines.append(contentsOf: result.diagnostics)
+        }
+        if lines.isEmpty { return true }
+
+        let alert = NSAlert()
+        alert.messageText = if !result.inaccessibleConfigBookmarkPaths.isEmpty {
+            "Ghostty config needs access"
+        } else if result.missingUserConfigPaths.count > 1 {
+            "Ghostty configs not found"
+        } else if result.missingUserConfigPaths.count == 1 {
+            "Ghostty config not found"
+        } else {
+            "Issues in your Ghostty config"
+        }
+        alert.informativeText = lines.joined(separator: "\n\n")
+        alert.alertStyle = result.missingUserConfigPaths.isEmpty
+            && result.inaccessibleConfigBookmarkPaths.isEmpty ? .informational : .warning
+        alert.addButton(withTitle: "OK")
+        if !result.inaccessibleConfigBookmarkPaths.isEmpty {
+            alert.addButton(withTitle: "Grant Access…")
+        }
+        let response = alert.runModal()
+        if response == .alertSecondButtonReturn {
+            return repickConfigFilesAndReload(result.inaccessibleConfigBookmarkPaths)
+        }
+        return false
+    }
+
+    /// Grant Access from launch / the reload alert: re-pick each path, then
+    /// reload libghostty the same way Settings does after a successful pick.
+    /// Without this, the process holds the grant but still runs the config
+    /// that was loaded before those files were readable.
+    @discardableResult
+    func repickConfigFilesAndReload(_ paths: [String]) -> Bool {
+        var granted = false
+        for path in paths where GhosttyConfigFileBookmarks.presentRepick(for: path) {
+            granted = true
+        }
+        guard granted else { return false }
+        return reloadAndReport()
+    }
+
+    /// Color accessors prefer the colors libghostty resolved for a live surface
+    /// (`resolvedColors`, fed by `GHOSTTY_ACTION_CONFIG_CHANGE`): that config has
+    /// the active `theme = light:X,dark:Y` side applied, so it's correct for both
+    /// plain and split themes — the same source Ghostty's own window chrome uses.
+    /// Before the first surface reports (e.g. the launch window) they fall back
+    /// to parsing the appearance-resolved theme file (issue #38), then to
+    /// libghostty's app-global getters, which are correct only for a plain theme.
+    var backgroundColor: NSColor {
+        if let rgb = resolvedColors?.background { return nsColor(rgb) }
+        if let hex = resolvedThemeColors()?.background, let c = nsColor(fromHex: hex) { return c }
+        return configColor("background") ?? NSColor(srgbRed: 0.11, green: 0.11, blue: 0.14, alpha: 1)
+    }
+
+    var effectiveBackgroundColor: NSColor {
+        adaptiveBackgroundColor ?? backgroundColor
+    }
+
+    var foregroundColor: NSColor {
+        if let rgb = resolvedColors?.foreground { return nsColor(rgb) }
+        if let hex = resolvedThemeColors()?.foreground, let c = nsColor(fromHex: hex) { return c }
+        return configColor("foreground") ?? .white
+    }
+
+    var accentColor: NSColor { paletteColor(at: 4) ?? foregroundColor }
+
+    func paletteColor(at index: Int) -> NSColor? {
+        guard (0 ..< 256).contains(index) else { return nil }
+        if let rgb = resolvedColors?.palette[index] { return nsColor(rgb) }
+        if let hex = resolvedThemeColors()?.palette[index], let c = nsColor(fromHex: hex) { return c }
+        guard let config else { return nil }
+        var palette = ghostty_config_palette_s()
+        let key = "palette"
+        guard ghostty_config_get(config, &palette, key, UInt(key.utf8.count)) else { return nil }
+        let c = withUnsafePointer(to: &palette.colors) {
+            $0.withMemoryRebound(to: ghostty_config_color_s.self, capacity: 256) { $0[index] }
+        }
+        return NSColor(srgbRed: CGFloat(c.r) / 255, green: CGFloat(c.g) / 255, blue: CGFloat(c.b) / 255, alpha: 1)
+    }
+
+    /// The alpha of the overlay that dims an unfocused split pane, derived
+    /// from the user's `unfocused-split-opacity`. Ghostty defines that key as
+    /// the unfocused *pane's* opacity (1 = no dimming; libghostty clamps it to
+    /// 0.15…1 at load), so the overlay draws at its complement — the same
+    /// reading Ghostty.app applies.
+    var unfocusedSplitDimOpacity: Double {
+        guard let config else { return 0 }
+        var opacity = 1.0
+        let key = "unfocused-split-opacity"
+        guard ghostty_config_get(config, &opacity, key, UInt(key.utf8.count)) else { return 0 }
+        return 1 - opacity
+    }
+
+    /// The color of that overlay (`unfocused-split-fill`). The key is unset by
+    /// default and Ghostty falls back to the theme background, so the dim
+    /// reads as the pane fading toward the background — correct on light and
+    /// dark themes alike.
+    var unfocusedSplitFill: NSColor {
+        configColor("unfocused-split-fill") ?? backgroundColor
+    }
+
+    private func configColor(_ key: String) -> NSColor? {
+        guard let config else { return nil }
+        var color = ghostty_config_color_s()
+        guard ghostty_config_get(config, &color, key, UInt(key.utf8.count)) else { return nil }
+        return NSColor(srgbRed: CGFloat(color.r) / 255, green: CGFloat(color.g) / 255, blue: CGFloat(color.b) / 255, alpha: 1)
+    }
+
+    /// An explicit shell command from the user's ghostty config (`command =`),
+    /// used as the fallback when a layout pane doesn't name its own `shell`.
+    /// Returns nil when the config doesn't set one — and that nil is important:
+    /// the caller then leaves `config.command` unset so libghostty resolves the
+    /// user's *login* shell itself (via the password database). We deliberately
+    /// do NOT fall back to `$SHELL`: that's the shell of whatever process
+    /// launched the app (often `/bin/zsh` from the launchd/login chain), not the
+    /// user's login shell, so using it forced every pane onto `zsh` regardless
+    /// of the user's real shell.
+    var configuredShell: String? {
+        guard let command = configString("command"), !command.isEmpty else { return nil }
+        return command
+    }
+
+    private func configString(_ key: String) -> String? {
+        guard let config else { return nil }
+        var str = ghostty_string_s()
+        guard ghostty_config_get(config, &str, key, UInt(key.utf8.count)), let ptr = str.ptr else { return nil }
+        return String(bytes: UnsafeRawBufferPointer(start: ptr, count: Int(str.len)), encoding: .utf8)
+    }
+
+    private func configBool(_ key: String, default defaultValue: Bool) -> Bool {
+        guard let config else { return defaultValue }
+        var value = defaultValue
+        guard ghostty_config_get(config, &value, key, UInt(key.utf8.count)) else { return defaultValue }
+        return value
+    }
+
+    // MARK: - Bell & secure input config (read by GhosttyCallbacks)
+
+    /// The user's `bell-features` set. Same bit layout as Ghostty.app's
+    /// `BellFeatures`; `title` and `border` exist in the config but FuturaTerm
+    /// implements only the app-level features (see `GhosttyCallbacks`'s
+    /// `RING_BELL` case).
+    struct BellFeatures: OptionSet {
+        let rawValue: CUnsignedInt
+        static let system = BellFeatures(rawValue: 1 << 0)
+        static let audio = BellFeatures(rawValue: 1 << 1)
+        static let attention = BellFeatures(rawValue: 1 << 2)
+        static let title = BellFeatures(rawValue: 1 << 3)
+        static let border = BellFeatures(rawValue: 1 << 4)
+    }
+
+    var bellFeatures: BellFeatures {
+        guard let config else { return [] }
+        var raw: CUnsignedInt = 0
+        let key = "bell-features"
+        guard ghostty_config_get(config, &raw, key, UInt(key.utf8.count)) else { return [] }
+        return BellFeatures(rawValue: raw)
+    }
+
+    /// Absolute path of the user's `bell-audio-path`, or nil when unset.
+    var bellAudioPath: String? {
+        guard let config else { return nil }
+        var value = ghostty_config_path_s()
+        let key = "bell-audio-path"
+        guard ghostty_config_get(config, &value, key, UInt(key.utf8.count)), let ptr = value.path else { return nil }
+        let path = String(cString: ptr)
+        return path.isEmpty ? nil : path
+    }
+
+    var bellAudioVolume: Float {
+        guard let config else { return 0.5 }
+        var value = 0.5
+        let key = "bell-audio-volume"
+        _ = ghostty_config_get(config, &value, key, UInt(key.utf8.count))
+        return Float(value)
+    }
+
+    /// `macos-auto-secure-input`: gate for enabling secure keyboard input
+    /// automatically while a surface reports a password prompt.
+    var autoSecureInput: Bool {
+        configBool("macos-auto-secure-input", default: true)
+    }
+
+    /// `macos-secure-input-indication`: whether to show the per-pane lock
+    /// badge while secure input is active.
+    var secureInputIndication: Bool {
+        configBool("macos-secure-input-indication", default: true)
+    }
+
+    private func loadConfig() -> (ghostty_config_t?, ReloadResult) {
+        var result = ReloadResult(diagnostics: [])
+        guard let cfg = ghostty_config_new() else { return (nil, result) }
+
+        // Recompute the wrapper files against the user's config as it exists
+        // right now: the overrides' shell-integration-features line merges the
+        // user's own value (#75), which may have changed since the last load.
+        FuturaTermConfig.shared.regenerate()
+
+        // Three-layer ghostty config:
+        //   1. FuturaTerm defaults — tasteful first-launch values.
+        //   2. User's Ghostty config files, overriding any default. In automatic
+        //      mode, libghostty loads its default roots.
+        //   3. FuturaTerm overrides — keys FuturaTerm absolutely needs to control,
+        //      currently the background keys for the window-level translucency
+        //      contract (default-background paint, opacity value, blur).
+        //      Loaded last so it overrides the user.
+        // libghostty merges last-wins, so this ordering produces:
+        //   FuturaTerm defaults < user's Ghostty config < FuturaTerm overrides
+        FuturaTermConfig.shared.defaultsPath.withCString { ghostty_config_load_file(cfg, $0) }
+        let selection: GhosttyConfigSelection = if Preferences.isTestRun || BenchmarkControl.isEnabled {
+            .disabled
+        } else {
+            Preferences.shared.ghosttyConfigSelection
+        }
+        let source = GhosttyConfigSource(selection: selection)
+        var inaccessible: [String] = []
+        let missing = source.load(
+            loadDefaultFiles: { ghostty_config_load_default_files(cfg) },
+            loadCustomFile: { path in
+                let access = GhosttyConfigFileBookmarks.startAccessing(path: path)
+                if SecurityScopedBookmark.needsUserGrant(access) {
+                    inaccessible.append(path)
+                    logger.info("user Ghostty config bookmark unusable at \(path, privacy: .public); skipping")
+                    return false
+                }
+                guard FileManager.default.fileExists(atPath: path) else {
+                    logger.info("user Ghostty config not found at \(path, privacy: .public); skipping")
+                    return false
+                }
+                path.withCString { ghostty_config_load_file(cfg, $0) }
+                return true
+            }
+        )
+        result.inaccessibleConfigBookmarkPaths = inaccessible
+        result.missingUserConfigPaths = missing.filter { !inaccessible.contains($0) }
+        FuturaTermConfig.shared.overridesPath.withCString { ghostty_config_load_file(cfg, $0) }
+        ghostty_config_load_recursive_files(cfg)
+        ghostty_config_finalize(cfg)
+
+        // Collect ghostty's diagnostics (parse errors, unknown keys, bad
+        // values). Log them and surface to the caller so the Settings reload
+        // button can show them in an alert.
+        let diagCount = ghostty_config_diagnostics_count(cfg)
+        for i in 0 ..< diagCount {
+            let diag = ghostty_config_get_diagnostic(cfg, i)
+            if let msg = diag.message {
+                let s = String(cString: msg)
+                logger.warning("config: \(s, privacy: .public)")
+                result.diagnostics.append(s)
+            }
+        }
+
+        return (cfg, result)
+    }
+
+    /// Candidate ghostty resource dirs, highest priority first. FuturaTerm ships
+    /// the ghostty resources in its own bundle (downloaded by setup.sh) under
+    /// `Contents/Resources/ghostty`, mirroring a real Ghostty.app, with the
+    /// compiled terminfo DB at the sibling `Contents/Resources/terminfo`. So
+    /// TERM=xterm-ghostty, named themes, and shell integration resolve with no
+    /// Ghostty.app install. The installed Ghostty.app dirs remain as fallbacks
+    /// for the rare case the bundle is missing them (e.g. an unprepared dev
+    /// checkout).
+    private static let resourcePaths: [String] = {
+        var paths: [String] = []
+        if let resources = Bundle.main.resourceURL?.path {
+            paths.append(resources + "/ghostty")
+        }
+        paths.append("/Applications/Ghostty.app/Contents/Resources/ghostty")
+        paths.append(NSHomeDirectory() + "/Applications/Ghostty.app/Contents/Resources/ghostty")
+        return paths
+    }()
+
+    private func resolveResources() {
+        // Always resolve from our own candidates (bundle first), ignoring any
+        // inherited GHOSTTY_RESOURCES_DIR. A stale value — e.g. pointing at an
+        // installed Ghostty.app/FuturaTerm.app that lacks terminfo — would
+        // otherwise shadow our complete bundle and leave libghostty deriving a
+        // broken TERMINFO, reintroducing #39/#40.
+        //
+        // We only set GHOSTTY_RESOURCES_DIR. TERMINFO is NOT set here on
+        // purpose: libghostty unconditionally overwrites it at shell spawn with
+        // dirname(GHOSTTY_RESOURCES_DIR)/terminfo (src/termio/Exec.zig), so any
+        // setenv here would be clobbered. Because our resources dir is
+        // .../Resources/ghostty, that derivation lands on .../Resources/terminfo
+        // — the sibling dir we ship — which is exactly what we want.
+        let resolver = GhosttyResourceResolver(
+            candidates: Self.resourcePaths,
+            fileExists: { FileManager.default.fileExists(atPath: $0) }
+        )
+        guard let resourcesDir = resolver.resolve() else {
+            unsetenv("GHOSTTY_RESOURCES_DIR")
+            return
+        }
+        self.resourcesDir = resourcesDir
+        setenv("GHOSTTY_RESOURCES_DIR", resourcesDir, 1)
+    }
+
+    /// Our bundled compiled terminfo DB, for callers that need to read the
+    /// `xterm-ghostty` entry with a tool of their own (`RemoteTerminfo` pipes
+    /// `infocmp` output to a remote `tic`). nil before `resolveResources` has
+    /// run or when no candidate qualified.
+    var bundledTerminfoDirectory: String? {
+        resourcesDir.map { GhosttyResourceResolver.terminfoDirectory(forResourcesDir: $0) }
+    }
+
+    // MARK: - Theme split resolution (issue #38)
+
+    /// When the effective `theme` is a `light:X,dark:Y` split, the colors of the
+    /// side matching the current OS appearance — read straight from the theme
+    /// file, since libghostty's config getters always resolve a split to the
+    /// light side. Nil for a plain theme (the getters handle those correctly).
+    ///
+    /// Memoized on `configVersion`: the on-disk inputs only change when the
+    /// config reloads or the appearance flips, both of which bump the version.
+    private func resolvedThemeColors() -> ThemeResolver.Colors? {
+        if let cache = themeColorsCache, cache.version == configVersion {
+            return cache.colors
+        }
+        let colors = computeResolvedThemeColors()
+        themeColorsCache = (configVersion, colors)
+        return colors
+    }
+
+    private func computeResolvedThemeColors() -> ThemeResolver.Colors? {
+        guard let resourcesDir else { return nil }
+        // Reconstruct the effective `theme` from the layers we control, matching
+        // libghostty's last-wins merge: our defaults, then the user's root files.
+        var configText = (try? String(contentsOfFile: FuturaTermConfig.shared.defaultsPath, encoding: .utf8)) ?? ""
+        if let userText = FuturaTermConfig.userGhosttyConfigText() {
+            configText += "\n" + userText
+        }
+        guard let themeValue = ThemeResolver.themeValue(inConfigText: configText),
+              let side = ThemeResolver.resolve(themeValue: themeValue, scheme: systemScheme)
+        else { return nil }
+
+        // A theme value is either a bare name (resolved against the bundled
+        // themes dir) or an absolute / `~` path to a user theme file — pass the
+        // latter through untouched instead of nesting it under the themes dir.
+        let themeFile: String =
+            side.hasPrefix("/") || side.hasPrefix("~")
+                ? (side as NSString).expandingTildeInPath
+                : resourcesDir + "/themes/" + side
+        guard let themeText = try? String(contentsOfFile: themeFile, encoding: .utf8) else { return nil }
+        return ThemeResolver.colors(inThemeFile: themeText)
+    }
+
+    // MARK: - Surface-resolved chrome colors (Ghostty's CONFIG_CHANGE pattern)
+
+    /// A snapshot of the chrome colors read out of a libghostty config handle,
+    /// held as plain values so it can cross from the action callback (which may
+    /// run off the main actor) to the main actor. `palette` always has 256
+    /// entries; an entry is nil only when the getter fails.
+    struct ResolvedColors: Equatable {
+        struct RGB: Equatable {
+            var r: UInt8
+            var g: UInt8
+            var b: UInt8
+        }
+
+        var background: RGB?
+        var foreground: RGB?
+        var palette: [RGB?]
+    }
+
+    /// Read the chrome colors out of a libghostty config handle. `nonisolated`
+    /// so the `GHOSTTY_ACTION_CONFIG_CHANGE` callback can snapshot synchronously
+    /// while the handle is valid — libghostty owns it only for the duration of
+    /// that call, so the values must be copied out before returning.
+    nonisolated static func readColors(from cfg: ghostty_config_t) -> ResolvedColors {
+        func color(_ key: String) -> ResolvedColors.RGB? {
+            var c = ghostty_config_color_s()
+            guard ghostty_config_get(cfg, &c, key, UInt(key.utf8.count)) else { return nil }
+            return .init(r: c.r, g: c.g, b: c.b)
+        }
+
+        var palette = [ResolvedColors.RGB?](repeating: nil, count: 256)
+        var raw = ghostty_config_palette_s()
+        let key = "palette"
+        if ghostty_config_get(cfg, &raw, key, UInt(key.utf8.count)) {
+            withUnsafePointer(to: &raw.colors) {
+                $0.withMemoryRebound(to: ghostty_config_color_s.self, capacity: 256) { ptr in
+                    for i in 0 ..< 256 {
+                        palette[i] = .init(r: ptr[i].r, g: ptr[i].g, b: ptr[i].b)
+                    }
+                }
+            }
+        }
+        return ResolvedColors(background: color("background"), foreground: color("foreground"), palette: palette)
+    }
+
+    /// Adopt the colors libghostty resolved for a live surface (delivered via
+    /// `GHOSTTY_ACTION_CONFIG_CHANGE`). Bumps `configVersion` and notifies the
+    /// AppKit chrome so it re-reads `FuturaTermTheme`, but only when the colors
+    /// actually changed — config-change actions fire for many reasons.
+    func adoptResolvedColors(_ colors: ResolvedColors) {
+        guard resolvedColors != colors else { return }
+        resolvedColors = colors
+        configVersion += 1
+        NotificationCenter.default.post(name: .futuraTermConfigDidChange, object: nil)
+    }
+
+    /// Update the temporary chrome tint without touching libghostty's config.
+    /// The terminal renderer remains authoritative for its own pixels; this
+    /// only brings the native window surfaces into visual alignment.
+    func adoptAdaptiveBackgroundColor(_ color: NSColor?) {
+        if let current = adaptiveBackgroundColor, let color, current.isVisuallyEqual(to: color) {
+            return
+        }
+        guard adaptiveBackgroundColor != nil || color != nil else { return }
+        adaptiveBackgroundColor = color
+        NotificationCenter.default.post(name: .futuraTermConfigDidChange, object: nil)
+    }
+
+    private func nsColor(_ rgb: ResolvedColors.RGB) -> NSColor {
+        NSColor(srgbRed: CGFloat(rgb.r) / 255, green: CGFloat(rgb.g) / 255, blue: CGFloat(rgb.b) / 255, alpha: 1)
+    }
+
+    private func nsColor(fromHex hex: String) -> NSColor? {
+        var s = hex.trimmingCharacters(in: .whitespaces)
+        if s.hasPrefix("#") { s.removeFirst() }
+        guard s.count == 6, let v = UInt32(s, radix: 16) else { return nil }
+        return NSColor(
+            srgbRed: CGFloat((v >> 16) & 0xFF) / 255,
+            green: CGFloat((v >> 8) & 0xFF) / 255,
+            blue: CGFloat(v & 0xFF) / 255,
+            alpha: 1
+        )
+    }
+}

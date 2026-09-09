@@ -1,0 +1,208 @@
+#!/bin/sh
+# Submit a Moonlight pairing PIN to Sunshine on this machine.
+# Talks only to https://127.0.0.1:47990. Never prints the admin password.
+# If Sunshine has no login we know, set one — do not send the user to the
+# admin page to create a username and password.
+set -eu
+
+PIN=""
+NAME="Mac"
+PRINT_JSON=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pin)
+      PIN="${2:-}"
+      shift 2
+      ;;
+    --name)
+      NAME="${2:-}"
+      shift 2
+      ;;
+    --print-json)
+      PRINT_JSON=1
+      shift
+      ;;
+    *)
+      echo "error: unknown argument $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "$PIN" in
+  [0-9][0-9][0-9][0-9]) ;;
+  *)
+    echo "error: --pin must be 4 digits" >&2
+    exit 2
+    ;;
+esac
+
+# Pair helper is invoked from ssh as sh -c; keep the client name free of quotes.
+NAME="$(printf '%s' "$NAME" | tr -cd 'A-Za-z0-9._-' | cut -c1-32)"
+if [ -z "$NAME" ]; then
+  NAME="Mac"
+fi
+
+JSON=$(printf '{"pin":"%s","name":"%s"}' "$PIN" "$NAME")
+if [ "$PRINT_JSON" -eq 1 ]; then
+  printf '%s\n' "$JSON"
+  exit 0
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "error: curl is required" >&2
+  exit 1
+fi
+
+CREDS="${FUTURATERM_SUNSHINE_ADMIN:-$HOME/.config/futuraterm/sunshine-admin}"
+USER_NAME=""
+PASSWORD=""
+BASE="https://127.0.0.1:47990"
+
+load_admin() {
+  USER_NAME=""
+  PASSWORD=""
+  [ -f "$CREDS" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      username=*) USER_NAME="${line#username=}" ;;
+      password=*) PASSWORD="${line#password=}" ;;
+    esac
+  done < "$CREDS"
+  [ -n "$USER_NAME" ] && [ -n "$PASSWORD" ]
+}
+
+write_admin() {
+  mkdir -p "$(dirname "$CREDS")"
+  old_umask="$(umask)"
+  umask 077
+  printf 'username=%s\npassword=%s\n' "$1" "$2" > "$CREDS"
+  chmod 600 "$CREDS"
+  umask "$old_umask"
+}
+
+random_pass() {
+  if [ -n "${FUTURATERM_SUNSHINE_PASSWORD:-}" ]; then
+    printf '%s' "$FUTURATERM_SUNSHINE_PASSWORD"
+    return 0
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 24 | tr -d '\n/+=\n' | cut -c1-24
+    return 0
+  fi
+  dd if=/dev/urandom bs=18 count=1 2>/dev/null | base64 | tr -d '\n/+=\n' | cut -c1-24
+}
+
+set_admin() {
+  if ! command -v sunshine >/dev/null 2>&1; then
+    echo "error: Sunshine is not installed" >&2
+    return 1
+  fi
+  user="$(id -un 2>/dev/null || printf '%s' "${USER:-futuraterm}")"
+  pass="$(random_pass)"
+  if [ -z "$pass" ]; then
+    echo "error: could not set Sunshine credentials" >&2
+    return 1
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user stop app-dev.lizardbyte.app.Sunshine.service >/dev/null 2>&1 || true
+  fi
+  if ! sunshine --creds "$user" "$pass" >/dev/null 2>&1; then
+    echo "error: could not set Sunshine credentials" >&2
+    return 1
+  fi
+  write_admin "$user" "$pass"
+  USER_NAME="$user"
+  PASSWORD="$pass"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user start app-dev.lizardbyte.app.Sunshine.service >/dev/null 2>&1 \
+      || systemctl --user enable --now app-dev.lizardbyte.app.Sunshine.service >/dev/null 2>&1 \
+      || true
+  fi
+  return 0
+}
+
+if ! load_admin; then
+  set_admin || exit 1
+fi
+
+probe_code() {
+  curl -sk -o /dev/null -w '%{http_code}' -u "$USER_NAME:$PASSWORD" "$BASE/api/config" || true
+}
+
+i=0
+code=""
+while [ "$i" -lt 20 ]; do
+  code="$(probe_code)"
+  case "$code" in
+    200 | 401 | 403) break ;;
+  esac
+  i=$((i + 1))
+  sleep 0.25 2>/dev/null || sleep 1
+done
+
+if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+  set_admin || exit 1
+  i=0
+  while [ "$i" -lt 20 ]; do
+    code="$(probe_code)"
+    case "$code" in
+      200 | 401 | 403) break ;;
+    esac
+    i=$((i + 1))
+    sleep 0.25 2>/dev/null || sleep 1
+  done
+fi
+
+post_pin() {
+  body="$1"
+  curl -sk -u "$USER_NAME:$PASSWORD" \
+    -H "Content-Type: application/json" \
+    -X POST "$BASE/api/pin" \
+    -d "$body"
+}
+
+RESP="$(post_pin "$JSON" || true)"
+case "$RESP" in
+  *pairing_id* | *pairingId*)
+    PAIRING_ID=""
+    if command -v python3 >/dev/null 2>&1; then
+      PAIRING_ID="$(curl -sk -u "$USER_NAME:$PASSWORD" "$BASE/api/pin" 2>/dev/null | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+try:
+    data = json.loads(raw)
+except Exception:
+    sys.exit(0)
+items = data
+if isinstance(data, dict):
+    items = data.get("pending") or data.get("pairings") or data.get("sessions") or data.get("named_certs") or []
+if not isinstance(items, list):
+    items = []
+for it in items:
+    if not isinstance(it, dict):
+        continue
+    pid = it.get("pairing_id") or it.get("pairingId") or it.get("id")
+    if pid:
+        print(pid)
+        break
+' || true)"
+    fi
+    if [ -n "$PAIRING_ID" ]; then
+      JSON=$(printf '{"pairing_id":"%s","pin":"%s","name":"%s"}' "$PAIRING_ID" "$PIN" "$NAME")
+      RESP="$(post_pin "$JSON" || true)"
+    fi
+    ;;
+esac
+
+case "$RESP" in
+  *'"status":true'* | *'"status": true'* | *'"status": "true"'*)
+    exit 0
+    ;;
+esac
+if [ -n "$RESP" ]; then
+  exit 0
+fi
+echo "error: Sunshine PIN submit failed" >&2
+exit 1
