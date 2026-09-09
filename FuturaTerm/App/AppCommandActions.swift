@@ -1,0 +1,306 @@
+import AppKit
+
+/// Inputs every `AppCommand` needs to do its work. The palette wraps its own
+/// `PaletteContext` into this; menu items build it directly.
+@MainActor
+struct AppCommandContext {
+    let appState: AppState
+    let projectStore: ProjectStore
+}
+
+extension AppCommand {
+    /// Returns the closure that performs this command, or nil if the command
+    /// doesn't apply in the current context (e.g. tab/pane commands when no
+    /// project is active, "Replace path" when the pane's pwd matches the
+    /// project's). Single source of truth for execution — used by both the
+    /// command palette and the menu bar so the two stay in sync.
+    @MainActor
+    func action(in ctx: AppCommandContext) -> (@MainActor () -> Void)? {
+        let projectID = ctx.appState.activeProjectID
+        let current = projectID.flatMap { id in ctx.projectStore.projects.first(where: { $0.id == id }) }
+
+        switch self {
+        case .newTab:
+            guard let projectID else { return nil }
+            return { ctx.appState.createTab(projectID: projectID, projects: ctx.projectStore.projects) }
+        case .closePane:
+            guard let projectID else { return nil }
+            return {
+                if let pane = ctx.appState.focusedPane(for: projectID) {
+                    ctx.appState.requestClosePane(pane.id, projectID: projectID)
+                }
+            }
+        case .closeTab:
+            // Close the active tab — pinned or normal. `requestCloseTab` owns
+            // the busy confirmation and routes a pinned tab to the unload path
+            // (sessions end, the record stays), so one command serves both.
+            guard let projectID,
+                  let tab = ctx.appState.workspaces[projectID]?.activeTab
+            else { return nil }
+            return { ctx.appState.requestCloseTab(tab.id, projectID: projectID) }
+        case .nextTab:
+            return { ctx.appState.selectGlobalTab(.next, projects: ctx.projectStore.projects) }
+        case .previousTab:
+            return { ctx.appState.selectGlobalTab(.previous, projects: ctx.projectStore.projects) }
+        // The project-scoped pair (what ctrl+]/ctrl+[ bind to by default):
+        // cycling wraps within the active project's own tabs, so a keystroke
+        // can never carry focus into another project the way the
+        // `.nextTab`/`.previousTab` pair above does.
+        case .nextTabInProject:
+            guard let projectID else { return nil }
+            return { ctx.appState.selectNextTab(projectID: projectID) }
+        case .previousTabInProject:
+            guard let projectID else { return nil }
+            return { ctx.appState.selectPreviousTab(projectID: projectID) }
+        case .recentTab:
+            guard let projectID else { return nil }
+            return { ctx.appState.cycleRecentTab(projectID: projectID) }
+        case .renameTab:
+            guard let projectID,
+                  let tab = ctx.appState.workspaces[projectID]?.activeTab
+            else { return nil }
+            let tabID = tab.id
+            return {
+                ctx.appState.sidebarVisible = true
+                // Defer a tick so the sidebar (and its row's TextField) is in
+                // the hierarchy before we ask it to begin editing — otherwise,
+                // when the sidebar was collapsed, the field can't take first
+                // responder. Applies to every caller (palette, menu, hotkey).
+                DispatchQueue.main.async { ctx.appState.renamingTabID = tabID }
+            }
+        case .pinTab:
+            // Pin the active tab. Only from a real project — the
+            // pinned workspace's own tabs are already pinned.
+            guard let projectID, projectID != PinnedTabs.projectID,
+                  let tab = ctx.appState.workspaces[projectID]?.activeTab
+            else { return nil }
+            return { ctx.appState.pinTab(tab.id, fromProject: projectID) }
+        case .unpinTab:
+            // Unpin the active pinned tab — back to its origin project.
+            guard projectID == PinnedTabs.projectID,
+                  let tab = ctx.appState.workspaces[PinnedTabs.projectID]?.activeTab
+            else { return nil }
+            return { ctx.appState.unpinTab(tab.id, projects: ctx.projectStore.projects) }
+        case .separateAllPanes:
+            // The palette/keybind form of the tab context menu's "Separate
+            // Panes": every pane of the active tab after the first opens in
+            // its own tab, shells intact. nil (hidden/fall-through) on a
+            // single-pane tab — there is nothing to separate.
+            guard let projectID,
+                  let tab = ctx.appState.workspaces[projectID]?.activeTab,
+                  tab.splitRoot.allPanes().count > 1
+            else { return nil }
+            return { ctx.appState.separateTabPanes(tab.id, projectID: projectID) }
+        case .separateCurrentPane:
+            // Split just the focused pane out of the active tab into its own
+            // tab, landing right after the source tab (mirroring where
+            // "Separate All Panes" puts them). Same single-pane guard. Works
+            // in the pinned workspace too (the separated tab is pinned from
+            // birth); its destPath is only a fallback — the pane keeps its cwd.
+            guard let projectID,
+                  let ws = ctx.appState.workspaces[projectID],
+                  let tab = ws.activeTab,
+                  tab.splitRoot.allPanes().count > 1,
+                  let paneID = tab.focusedPaneID
+            else { return nil }
+            let destPath: String
+            if projectID == PinnedTabs.projectID {
+                destPath = PinnedTabs.fallbackRoot
+            } else if let current {
+                destPath = current.path
+            } else {
+                return nil
+            }
+            let index = ws.tabs.firstIndex(where: { $0.id == tab.id }).map { $0 + 1 }
+            return { ctx.appState.separatePane(paneID, toProject: projectID, destPath: destPath, at: index) }
+        case .splitRight:
+            guard let projectID else { return nil }
+            return { ctx.appState.splitPane(direction: .horizontal, projectID: projectID) }
+        case .splitDown:
+            guard let projectID else { return nil }
+            return { ctx.appState.splitPane(direction: .vertical, projectID: projectID) }
+        case .splitAuto:
+            guard let projectID else { return nil }
+            return { ctx.appState.autoSplitPane(projectID: projectID) }
+        case .zoomPane:
+            guard let projectID else { return nil }
+            return { ctx.appState.toggleZoom(projectID: projectID) }
+        case .focusLeft:
+            guard let projectID else { return nil }
+            return { ctx.appState.focusPaneInDirection(.left, projectID: projectID) }
+        case .focusRight:
+            guard let projectID else { return nil }
+            return { ctx.appState.focusPaneInDirection(.right, projectID: projectID) }
+        case .focusUp:
+            guard let projectID else { return nil }
+            return { ctx.appState.focusPaneInDirection(.up, projectID: projectID) }
+        case .focusDown:
+            guard let projectID else { return nil }
+            return { ctx.appState.focusPaneInDirection(.down, projectID: projectID) }
+        case .nextPane:
+            guard let projectID else { return nil }
+            return { ctx.appState.cyclePane(forward: true, projectID: projectID) }
+        case .previousPane:
+            guard let projectID else { return nil }
+            return { ctx.appState.cyclePane(forward: false, projectID: projectID) }
+        case .resizeLeft:
+            guard let projectID else { return nil }
+            return { ctx.appState.resizePane(.left, projectID: projectID) }
+        case .resizeRight:
+            guard let projectID else { return nil }
+            return { ctx.appState.resizePane(.right, projectID: projectID) }
+        case .resizeUp:
+            guard let projectID else { return nil }
+            return { ctx.appState.resizePane(.up, projectID: projectID) }
+        case .resizeDown:
+            guard let projectID else { return nil }
+            return { ctx.appState.resizePane(.down, projectID: projectID) }
+        case .copySessionID:
+            // The focused pane's zmx session name (`futuraterm-<slug>-<hex>`) — the
+            // id `futuraterm session list` prints and `zmx attach` takes. Useful for
+            // pointing an LLM at a pane's live output. Copies silently, matching
+            // the sidebar's "Copy Path".
+            guard let projectID, let pane = ctx.appState.focusedPane(for: projectID) else { return nil }
+            let sessionName = pane.sessionName
+            return {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(sessionName, forType: .string)
+            }
+        case .openProject:
+            return { _ = ctx.appState.openProject(store: ctx.projectStore) }
+        case .newRemoteProject:
+            return { ctx.appState.isNewRemoteProjectSheetPresented = true }
+        case .viewDesktop:
+            guard let current, current.isRemote else { return nil }
+            return {
+                Task { await ctx.appState.viewDesktop(project: current) }
+            }
+        case .renameProject:
+            guard let current else { return nil }
+            let projectID = current.id
+            return {
+                ctx.appState.sidebarVisible = true
+                // See .renameTab: defer so the sidebar row exists first.
+                DispatchQueue.main.async { ctx.appState.renamingProjectID = projectID }
+            }
+        case .unloadProject:
+            // The pinned workspace can't be unloaded (its tabs unload one by
+            // one, only when their own sessions die).
+            guard let projectID, projectID != PinnedTabs.projectID,
+                  ctx.appState.isProjectLoaded(projectID)
+            else { return nil }
+            return { ctx.appState.requestUnloadProject(projectID) }
+        case .removeProject:
+            guard let projectID, projectID != PinnedTabs.projectID else { return nil }
+            return {
+                ctx.appState.requestRemoveProject(projectID) {
+                    if let project = ctx.projectStore.projects.first(where: { $0.id == projectID }) {
+                        ctx.appState.preservePinnedOriginGrant(from: project)
+                    }
+                    ctx.appState.removeProject(projectID)
+                    ctx.projectStore.remove(id: projectID)
+                }
+            }
+        case .replaceProjectPathWithCurrentDir:
+            // Remote projects (#104): OSC 7 reports a directory on the REMOTE
+            // host — writing it into `Project.path` would corrupt the
+            // project's identity into a local-looking path.
+            guard let current, !current.isRemote,
+                  let pane = ctx.appState.focusedPane(for: current.id),
+                  let pwd = pane.nsView?.currentPwd, !pwd.isEmpty,
+                  current.path != pwd
+            else { return nil }
+            return { ctx.appState.replaceProjectPathWithCurrentDir(projectStore: ctx.projectStore) }
+        case .applyLayout:
+            // Requires an applicable central file. `.invalid` stays enabled on
+            // purpose: invoking it surfaces the parse-error dialog instead of
+            // failing silently. `.none`/`.emptyTabs` disable the menu item and
+            // mute the palette row (see `paletteDisabledHint`).
+            guard let current else { return nil }
+            switch ctx.appState.projectFiles.applyState(forProjectPath: current.path, preferredSlug: ProjectSlug.slug(from: current.name)) {
+            case .applicable,
+                 .invalid:
+                return { ctx.appState.applyLayoutPresentingError(current, confirming: true) }
+            case .emptyTabs,
+                 .none:
+                return nil
+            }
+        case .saveLayout:
+            guard let current else { return nil }
+            return { ctx.appState.saveLayoutPresentingError(current, siblingProjects: ctx.projectStore.projects) }
+        case .nextProject:
+            return { ctx.appState.selectNextProject(projects: ctx.projectStore.sidebarProjectOrder) }
+        case .previousProject:
+            return { ctx.appState.selectPreviousProject(projects: ctx.projectStore.sidebarProjectOrder) }
+        case .toggleSidebar:
+            return { ctx.appState.sidebarVisible.toggle() }
+        case .closeWindow:
+            return { (NSApp.delegate as? AppDelegate)?.mainWindow?.orderOut(nil) }
+        case .toggleCommandPalette:
+            return { ctx.appState.isCommandPaletteVisible.toggle() }
+        case .manageSessions:
+            return { ctx.appState.isSessionManagerPresented = true }
+        case .manageEnvironments:
+            return { ctx.appState.isEnvironmentManagerPresented = true }
+        case .reloadGhosttyConfig:
+            return {
+                guard GhosttyApp.shared.reloadAndReport() else { return }
+                ctx.appState.presentToast("Ghostty config reloaded")
+            }
+        case .toggleQuickTerminal:
+            return { QuickTerminalService.shared.toggle() }
+        case .checkForUpdate:
+            if AppDistribution.isAppStore { return nil }
+            // Always present in the palette; the guard only no-ops when a check
+            // is already in flight (canCheckForUpdates flips false during one).
+            return {
+                guard Updater.shared.canCheckForUpdates else { return }
+                Updater.shared.checkForUpdates()
+            }
+        }
+    }
+
+    /// Why this command shows muted-but-visible in the palette, or nil when it
+    /// should follow the default rule (hidden when `action(in:)` is nil).
+    /// "Apply Layout" opts in when a file is missing or tab-less. "View
+    /// Desktop" opts in on a local (or missing) project so the row stays
+    /// visible with a reason instead of vanishing.
+    @MainActor
+    func paletteDisabledHint(in ctx: AppCommandContext) -> String? {
+        let projectID = ctx.appState.activeProjectID
+        let current = projectID.flatMap { id in ctx.projectStore.projects.first(where: { $0.id == id }) }
+        if self == .viewDesktop {
+            return current?.isRemote == true ? nil : DesktopView.notRemoteReason
+        }
+        guard self == .applyLayout, let current else { return nil }
+        switch ctx.appState.projectFiles.applyState(forProjectPath: current.path, preferredSlug: ProjectSlug.slug(from: current.name)) {
+        case .none:
+            return "No project file for this project — use “Save Layout” to create one"
+        case .emptyTabs:
+            return "The project file declares no tabs"
+        case .applicable,
+             .invalid:
+            return nil
+        }
+    }
+
+    /// Secondary line for an *enabled* palette row. Only "Apply Layout" uses
+    /// it: when several files that are *this project's own* (its slug owns the
+    /// filename) declare its path, the lookup picks one — say which, so a
+    /// hand-authored duplicate doesn't read as "my edits don't apply". A
+    /// sibling project's file on the same directory is not a duplicate and is
+    /// left out.
+    @MainActor
+    func paletteSubtitle(in ctx: AppCommandContext) -> String? {
+        guard self == .applyLayout,
+              let projectID = ctx.appState.activeProjectID,
+              let current = ctx.projectStore.projects.first(where: { $0.id == projectID })
+        else { return nil }
+        let slug = ProjectSlug.slug(from: current.name)
+        let mine = ctx.appState.projectFiles.matches(forProjectPath: current.path)
+            .filter { ProjectSlug.owns(filename: $0.url.lastPathComponent, slug: slug) }
+        guard mine.count > 1 else { return nil }
+        let ignored = mine.dropFirst().map(\.url.lastPathComponent).joined(separator: ", ")
+        return "Using \(mine[0].url.lastPathComponent) — ignoring duplicate \(ignored)"
+    }
+}

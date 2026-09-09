@@ -1,0 +1,236 @@
+name: Benchmark
+
+# Window-state resource benchmark (scripts/benchmark.py). Pushes to main
+# publish a `benchmark-results` artifact; PR runs pool the last several main
+# runs' artifacts into a per-metric median baseline and post a comparison
+# table to the job summary.
+#
+# PR runs can't label or comment directly: `pull_request` from a fork gets a
+# read-only GITHUB_TOKEN (the `permissions:` block is capped at read regardless
+# of what it declares), so any write 403s. Instead the PR job renders the report
+# and uploads it as an artifact; the `benchmark-report.yml` companion, triggered
+# via `workflow_run`, runs in the base repo with a read/write token and does the
+# label + comment writes. See that file for the trusted-side half.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      swift: ${{ steps.filter.outputs.swift }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            swift:
+              - "**/*.swift"
+              - "project.yml"
+              - "mise.toml"
+              - "scripts/**"
+              - ".github/workflows/benchmark.yml"
+
+  # Fetch the latest main baseline in parallel with the build+sample job. It's
+  # pure GitHub API + a download with no dependency on the build, so keeping it
+  # off the benchmark job's critical path removes its latency entirely. Runs on
+  # a cheap ubuntu runner and hands the file to `benchmark` via an artifact.
+  baseline:
+    name: Fetch baseline
+    needs: changes
+    if: needs.changes.outputs.swift == 'true' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # download the baseline artifact from a main run
+    steps:
+      - name: Fetch main baselines
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Pool up to the 10 most recent successful main runs: a PR delta
+          # against a single main run is one noisy sample vs. another, and one
+          # unlucky main run then mislabels every PR until the next push
+          # replaces it — the report medians the pool per metric instead. Runs
+          # whose benchmark job was skipped by the paths filter have no
+          # artifact (and old ones expire), so scan deeper than we keep.
+          mkdir -p baseline
+          count=0
+          for run_id in $(gh run list --workflow benchmark.yml --branch main --status success \
+              --limit 40 --json databaseId --jq '.[].databaseId'); do
+            if gh run download "$run_id" --name benchmark-results --dir "download/$run_id" 2>/dev/null; then
+              count=$((count + 1))
+              # The index prefix keeps newest-first order through the report
+              # step's lexicographic glob (the pooled `commit` header reads it).
+              cp "download/$run_id/results.json" \
+                "$(printf 'baseline/results-%02d-%s.json' "$count" "$run_id")"
+              echo "baseline $count: run $run_id"
+              if [ "$count" -ge 10 ]; then break; fi
+            fi
+          done
+          if [ "$count" -eq 0 ]; then
+            echo "no main baseline found; reporting absolute values"
+          fi
+
+      - name: Upload baselines
+        if: hashFiles('baseline/*.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-baseline
+          path: baseline/*.json
+
+  benchmark:
+    name: Window states
+    needs: [changes, baseline]
+    # `baseline` is skipped on pushes to main (it's PR-only); always() lets this
+    # job run anyway, gated on the real condition. A failed baseline fetch must
+    # not block the benchmark — the report just falls back to absolute values.
+    if: |
+      always() && needs.changes.outputs.swift == 'true'
+      && needs.baseline.result != 'cancelled'
+    runs-on: macos-26
+    timeout-minutes: 30
+    # Read-only: the label/comment writes live in benchmark-report.yml, which
+    # runs with a read/write token because a fork PR can't get one here. This
+    # job just renders the report and hands it off as an artifact.
+    permissions:
+      contents: read
+      actions: read # download the baseline artifact
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: jdx/mise-action@v4.2.5
+
+      # ISO week (YYYY-Www) — makes the GhosttyKit cache self-refresh weekly.
+      - name: Cache epoch
+        id: epoch
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      # Shared verbatim with the test workflow — same key, so both feed one
+      # GhosttyKit cache entry. setup.sh is a presence check, so a restored
+      # cache makes it a no-op. Keyed on setup.sh + the ISO week so a new
+      # upstream ghostty release is picked up within a week (setup.sh pulls
+      # `latest`, but the presence check would otherwise never re-download).
+      - name: Cache GhosttyKit
+        uses: actions/cache@v6
+        with:
+          path: |
+            GhosttyKit.xcframework
+            FuturaTerm/Resources/ghostty
+            FuturaTerm/Resources/terminfo
+            FuturaTerm/Resources/zmx
+            .ghosttykit-tag
+          # The tag stamp is cached with the artifacts it describes (test.yml).
+          #
+          # NO restore-keys fallback: pairing a time-rolling key with a prefix
+          # restore-key re-saves last week's stale content under the fresh key
+          # forever (see test.yml for the full rationale). Without it, a new
+          # week starts empty and setup re-downloads the current `latest`.
+          key: ghosttykit-${{ hashFiles('scripts/setup.sh') }}-${{ steps.epoch.outputs.week }}
+
+      # Runs BEFORE the DerivedData cache, which keys on what this installs.
+      - name: Setup GhosttyKit
+        run: mise run setup --verbose
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Release build products, keyed on the GhosttyKit actually installed above
+      # — see test.yml's unit job for why that hash is load-bearing (a pinned
+      # release is not immutable) and why it can only be read after setup.
+      # Separate key prefix from the test workflow's Debug cache: same on-disk
+      # path (build/DerivedData), different namespace, so the two configs never
+      # clobber each other. Release incremental caching is less reliable than
+      # Debug, but the benchmark measures runtime resource use, not build
+      # correctness, so a partial recompile only costs time — whereas a .pcm
+      # from a different framework fails the build outright, which is what the
+      # framework hash rules out.
+      - name: Restore DerivedData (Release)
+        id: derived
+        uses: actions/cache/restore@v6
+        with:
+          path: build/DerivedData
+          key: derived-release-${{ hashFiles('GhosttyKit.xcframework/*/Headers/ghostty.h') }}-${{ hashFiles('**/*.swift', 'project.yml') }}-${{ github.run_id }}
+          restore-keys: |
+            derived-release-${{ hashFiles('GhosttyKit.xcframework/*/Headers/ghostty.h') }}-${{ hashFiles('**/*.swift', 'project.yml') }}-
+            derived-release-${{ hashFiles('GhosttyKit.xcframework/*/Headers/ghostty.h') }}-
+
+      - name: Build and benchmark
+        run: mise run bench --verbose
+
+      # Under the restore-time key, success-only — see test.yml's unit job.
+      - name: Save DerivedData (Release)
+        uses: actions/cache/save@v6
+        with:
+          path: build/DerivedData
+          key: ${{ steps.derived.outputs.cache-primary-key }}
+
+      - name: Upload results
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results
+          path: build/benchmark/results.json
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-diagnostics
+          path: build/benchmark/diagnostics/
+          if-no-files-found: ignore
+
+      # Bring in the baselines the parallel job fetched. Best-effort: absent on
+      # pushes to main and when no main baseline exists yet, in which case the
+      # report falls back to absolute values.
+      - name: Download baselines
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: benchmark-baseline
+          path: baseline
+
+      - name: Report
+        run: |
+          args=(build/benchmark/results.json --verdict build/benchmark/verdict.json)
+          # The glob expands lexicographically, so the index-prefixed names
+          # arrive newest-first — what pool_baselines expects.
+          if compgen -G 'baseline/results-*.json' > /dev/null; then
+            args+=(--baseline baseline/results-*.json)
+          fi
+          python3 scripts/benchmark.py report "${args[@]}" > report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Hand the rendered report + verdict + PR number to benchmark-report.yml.
+      # That companion runs on `workflow_run` with a read/write token (this job
+      # can't get one for fork PRs) and does the label + comment writes. The PR
+      # number must ride along: `github.event.workflow_run.pull_requests` is
+      # empty for forked PRs, so the reporting side has no other way to find it.
+      - name: Stage report bundle
+        if: github.event_name == 'pull_request'
+        run: |
+          mkdir -p report-bundle
+          cp report.md build/benchmark/verdict.json report-bundle/
+          echo '${{ github.event.pull_request.number }}' > report-bundle/pr-number
+
+      - name: Upload report bundle
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-report
+          path: report-bundle/

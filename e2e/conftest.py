@@ -1,0 +1,144 @@
+"""End-to-end suite fixtures.
+
+The suite drives a real, GUI FuturaTerm.app: launched hermetically (throwaway
+$HOME, isolated app data + zmx namespace, Darwin-notification control — see
+scripts/_harness.py, shared with the benchmark) and asserted against through
+the bundled `futuraterm` CLI, whose `pane dump`/`pane inspect`/`pane list` read
+libghostty's own live state. `mise run e2e` builds the Debug app and runs
+this; `pytest e2e --app <path>` targets an already-built app.
+
+Isolation model: launching the app costs ~15-30s on a shared runner, so ONE
+instance serves the whole session. Tests own their blast radius instead —
+take the `fresh_tab` fixture for a tab of your own; the autouse janitor
+closes any tab a test leaves behind. Tests must not mutate the initial
+project pane (smoke tests read it).
+
+Every wait is a deadline poll (scripts/_harness.py `wait_for`), never a fixed
+sleep — the suite runs on loaded shared runners where any "long enough" sleep
+eventually isn't.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "scripts"))
+
+from _harness import HarnessError, FuturaTermHarness, wait_for  # noqa: E402
+
+DIAG_ROOT = REPO / "build" / "e2e" / "diagnostics"
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--app",
+        default=str(REPO / "build" / "DerivedData" / "Build" / "Products" / "Debug" / "FuturaTermDebug.app"),
+        help="Path to the built Debug app under test (default: FuturaTermDebug.app)",
+    )
+
+
+@pytest.fixture(scope="session")
+def app(request):
+    """The launched app instance, shared by the whole session."""
+    app_path = request.config.getoption("--app")
+    if not os.path.exists(app_path):
+        pytest.exit(f"no app at {app_path} — build it first (`mise run e2e` builds and runs)", returncode=2)
+    harness = FuturaTermHarness(app_path, home_prefix="futuraterm-e2e-home-")
+    _install_ssh_shim(harness)
+    try:
+        try:
+            harness.launch()
+            harness.open_project()
+            harness.wait_for_socket()
+        except HarnessError:
+            harness.dump_diagnostics(DIAG_ROOT / "session-launch")
+            raise
+        yield harness
+    finally:
+        harness.cleanup()
+
+
+# Expose each phase's report on the item so fixtures can ask "did the test
+# that just ran fail?" — the standard pytest pattern for teardown forensics.
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item, call):
+    report = yield
+    setattr(item, "rep_" + report.when, report)
+    return report
+
+
+def _install_ssh_shim(harness):
+    """Front `ssh` on the app's PATH with a shim that adds `-F <config>` when
+    the per-session config file exists (written by the docker-backed remote
+    fixture), and is a transparent passthrough otherwise.
+
+    Needed because OpenSSH resolves `~/.ssh/config` through the user record,
+    NOT $HOME — the hermetic home can't carry ssh config — and FuturaTerm
+    deliberately passes no ssh flags of its own (host/port/identity belong to
+    ssh config, per #104). The pane's surface command invokes plain `ssh`, so
+    PATH is the one seam that reaches it without touching the developer's
+    real ~/.ssh. Background ops are unaffected (they exec /usr/bin/ssh by
+    absolute path) — fine, the remote tests don't rely on them."""
+    shim_dir = Path(harness.home) / "ssh-shim"
+    shim_dir.mkdir()
+    harness.ssh_config_path = str(shim_dir / "ssh_config")
+    shim = shim_dir / "ssh"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'if [ -f "{harness.ssh_config_path}" ]; then\n'
+        f'  exec /usr/bin/ssh -F "{harness.ssh_config_path}" "$@"\n'
+        "fi\n"
+        'exec /usr/bin/ssh "$@"\n'
+    )
+    shim.chmod(0o755)
+    harness.env["PATH"] = f"{shim_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}"
+
+
+@pytest.fixture(autouse=True)
+def _tab_janitor(app):
+    """Close (force) any tab the test created, so tests can't leak state into
+    each other. Snapshot-based: pre-existing tabs are never touched."""
+    before = {tab["id"] for tab in app.cli_json("tab", "list")["tabs"]}
+    yield
+    for tab in app.cli_json("tab", "list")["tabs"]:
+        if tab["id"] not in before:
+            app.cli("tab", "close", tab["id"], "--force", check=False)
+
+
+@pytest.fixture(autouse=True)
+def _diagnostics_on_failure(request, app, _tab_janitor):
+    """On failure, capture a screenshot, the app's unified log, and every
+    pane's text into build/e2e/diagnostics/<test>/ (uploaded as a CI
+    artifact). Depends on the janitor so this teardown runs FIRST — while the
+    failed test's tabs still exist."""
+    yield
+    report = getattr(request.node, "rep_call", None)
+    if report is not None and report.failed:
+        diag_dir = DIAG_ROOT / request.node.name
+        app.dump_diagnostics(diag_dir)
+        app.dump_panes(diag_dir)
+
+
+@pytest.fixture
+def fresh_tab(app):
+    """A new tab for the test to own. `tab new --run /bin/sh` makes it active
+    with keyboard focus on a POSIX shell (bare `tab new` would type grok)."""
+    return app.new_tab()
+
+
+@pytest.fixture
+def live_pane(app, fresh_tab):
+    """The fresh tab's pane, waited until its surface is live and the shell
+    has drawn a prompt — the precondition for `pane run`/`pane key`/dump."""
+    pane = wait_for(lambda: app.panes(tab=fresh_tab["id"]), message="the fresh tab's pane")[0]
+    wait_for(
+        lambda: app.pane_text(pane=pane["id"]),
+        timeout=60,
+        message="the fresh tab's shell prompt",
+    )
+    return pane
+
+
