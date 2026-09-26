@@ -23,18 +23,12 @@ GIT_COMMIT=$(git -C "$PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null || echo "
 # FUTURATERM_MAS_CODESIGN_IDENTITY, FUTURATERM_MAS_SIGNING_CERT_P12,
 # FUTURATERM_MAS_SIGNING_CERT_PASSWORD, FUTURATERM_MAS_PROVISIONING_PROFILE,
 # FUTURATERM_DEVELOPMENT_TEAM.
-TETON_MAS_ID="Apple Distribution: Teton Web Ventures LLC (YOUR_APPLE_TEAM_ID)"
-TETON_TEAM_ID="YOUR_APPLE_TEAM_ID"
+# Do not hardcode Apple Team IDs or account emails in this public repo.
 CODESIGN_IDENTITY="${FUTURATERM_MAS_CODESIGN_IDENTITY:-}"
 DEVELOPMENT_TEAM="${FUTURATERM_DEVELOPMENT_TEAM:-}"
-if [[ -z "$CODESIGN_IDENTITY" ]] \
-  && security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$TETON_MAS_ID"; then
-  CODESIGN_IDENTITY="$TETON_MAS_ID"
-  DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-$TETON_TEAM_ID}"
-fi
 if [[ -z "$CODESIGN_IDENTITY" ]]; then
   echo "ERROR: Apple Distribution identity not found." >&2
-  echo "Create 'Apple Distribution: Teton Web Ventures LLC (YOUR_APPLE_TEAM_ID)' in Certificates, Identifiers & Profiles for Apple ID YOUR_APPLE_ID_EMAIL, or set FUTURATERM_MAS_CODESIGN_IDENTITY." >&2
+  echo "Set FUTURATERM_MAS_CODESIGN_IDENTITY (and FUTURATERM_DEVELOPMENT_TEAM) from private CI/secrets." >&2
   echo "MAS archives must not fall back to ad-hoc signing." >&2
   exit 1
 fi

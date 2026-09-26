@@ -1,5 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template only. Before exportArchive, substitute:
+    - teamID: FUTURATERM_DEVELOPMENT_TEAM
+    - provisioningProfiles key: your PRODUCT_BUNDLE_IDENTIFIER
+    - provisioningProfiles value: your MAS profile name
+  Do not commit real Team IDs or profile names to the public repo.
+-->
 <plist version="1.0">
 <dict>
 	<key>method</key>
@@ -14,8 +21,8 @@
 	<string>export</string>
 	<key>provisioningProfiles</key>
 	<dict>
-		<key>com.davidsolheim.futuraterm</key>
-		<string>FuturaTerm Mac App Store</string>
+		<key>YOUR_BUNDLE_IDENTIFIER</key>
+		<string>YOUR_MAS_PROVISIONING_PROFILE_NAME</string>
 	</dict>
 </dict>
 </plist>

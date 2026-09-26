@@ -28,22 +28,15 @@ GIT_COMMIT=$(git -C "$PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null || echo "
 SPARKLE_ED_PUBLIC_KEY="${SPARKLE_ED_PUBLIC_KEY:-SPARKLE_ED_PUBLIC_KEY_PLACEHOLDER}"
 
 # Developer ID signing. macOS TCC keys privacy grants to the app's designated
-# requirement, so every distributed build must use the SAME certificate:
-# "Developer ID Application: Teton Web Ventures LLC (YOUR_APPLE_TEAM_ID)" (Apple ID
-# YOUR_APPLE_ID_EMAIL). Ad-hoc is the project.yml default for local/debug/bench.
+# requirement, so every distributed build must use the SAME certificate across
+# releases. Set that identity via FUTURATERM_CODESIGN_IDENTITY (and
+# FUTURATERM_DEVELOPMENT_TEAM). Ad-hoc is the project.yml default for
+# local/debug/bench. Do not hardcode Team IDs or Apple account emails here.
 #
-# If FUTURATERM_CODESIGN_IDENTITY is unset, a machine that already has that
-# identity in the keychain (this one) uses it; otherwise the archive stays
-# ad-hoc. CI imports the .p12 and sets the identity explicitly.
-TETON_DEVELOPER_ID="Developer ID Application: Teton Web Ventures LLC (YOUR_APPLE_TEAM_ID)"
-TETON_TEAM_ID="YOUR_APPLE_TEAM_ID"
+# CI imports the .p12 and sets the identity explicitly. Local Release builds
+# should export the same env vars from a private secrets store.
 CODESIGN_IDENTITY="${FUTURATERM_CODESIGN_IDENTITY:-}"
 DEVELOPMENT_TEAM="${FUTURATERM_DEVELOPMENT_TEAM:-}"
-if [[ -z "$CODESIGN_IDENTITY" ]] \
-  && security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$TETON_DEVELOPER_ID"; then
-  CODESIGN_IDENTITY="$TETON_DEVELOPER_ID"
-  DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-$TETON_TEAM_ID}"
-fi
 SIGNING_OVERRIDES=()
 if [[ -n "$CODESIGN_IDENTITY" ]]; then
   SIGNING_OVERRIDES+=(

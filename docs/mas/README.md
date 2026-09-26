@@ -1,22 +1,24 @@
-# Mac App Store Connect listing pack
+# Mac App Store Connect listing pack (public stub)
 
-Paste-ready fields for an App Store Connect record. This pack is **not** a claim that FuturaTerm is listed or shipping on the Mac App Store. Direct GitHub DMGs remain the published channel (Developer ID + notarize). MAS archives use a separate AppStore configuration; see `AGENTS.md` Releasing.
+Paste-ready **structure** for an App Store Connect record. This pack is **not** a claim that FuturaTerm is listed or shipping on the Mac App Store. Direct GitHub DMGs remain the published channel (Developer ID + notarize). MAS archives use a separate AppStore configuration; see `AGENTS.md` Releasing.
+
+**Do not commit Apple account identifiers, Team IDs, SKUs, API keys, or provisioning profile names to this public repository.** Keep those in a private ops location (private `teton-web/futuraterm`, Doppler `teton-certs`, or CI secrets).
 
 Do not invent a dollar price. Paid upfront, no IAP / StoreKit.
 
-## Identifiers
+## Identifiers (set privately)
 
-| Field | Value |
+| Field | Where to set |
 | --- | --- |
-| SKU / bundle ID | `com.davidsolheim.futuraterm` |
-| Apple ID (account) | `YOUR_APPLE_ID_EMAIL` |
-| Team | `YOUR_APPLE_TEAM_ID` / Teton Web Ventures LLC |
-| Signing (MAS) | Apple Distribution: Teton Web Ventures LLC (`YOUR_APPLE_TEAM_ID`) |
-| Signing (Direct) | Developer ID Application: Teton Web Ventures LLC (`YOUR_APPLE_TEAM_ID`) |
+| SKU / bundle ID | Private ASC record / `PRODUCT_BUNDLE_IDENTIFIER` in your fork’s `project.yml` |
+| Apple ID (account) | Private ops only — never commit |
+| Team ID | `FUTURATERM_DEVELOPMENT_TEAM` (env / CI) — never commit |
+| Signing (MAS) | `FUTURATERM_MAS_CODESIGN_IDENTITY` + Apple Distribution cert (env / CI) |
+| Signing (Direct) | `FUTURATERM_CODESIGN_IDENTITY` + Developer ID cert (env / CI) |
 | Primary category | Developer Tools |
 | Age rating | 4+ (SSH / outbound network to user-specified hosts; no user-generated social content) |
 
-Same bundle id on both channels. Same team. Different identity and entitlements.
+Same bundle id on both channels when you publish both. Same team. Different identity and entitlements.
 
 ## Short description
 
