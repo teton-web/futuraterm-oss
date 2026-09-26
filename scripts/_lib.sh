@@ -104,3 +104,24 @@ bump_patch_version() {
   echo "error: cannot bump marketing version '$version' (want X.Y.Z)" >&2
   return 1
 }
+
+# First quoted codesigning identity whose name starts with KIND.
+# KIND is the certificate type only (for example "Developer ID Application"),
+# never a company name, Apple ID, or Team ID. Callers pass the type; this
+# function appends the colon that security prints after it.
+discover_codesign_identity() {
+  local kind="$1"
+  local line=""
+  # `|| true` keeps a missing `security` binary, or SIGPIPE from `head`, from
+  # aborting callers under `set -e` / `pipefail`. No match prints an empty line.
+  line="$(security find-identity -v -p codesigning 2>/dev/null \
+    | sed -n "s/.*\"\\(${kind}: [^\"]*\\)\".*/\\1/p" \
+    | head -n 1 || true)"
+  printf '%s\n' "$line"
+}
+
+# Trailing 10-character Apple Team ID on a codesign identity, when present.
+team_id_from_identity() {
+  local identity="$1"
+  printf '%s\n' "$identity" | sed -n 's/.*(\([A-Za-z0-9]\{10\}\))$/\1/p'
+}

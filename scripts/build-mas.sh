@@ -24,11 +24,21 @@ GIT_COMMIT=$(git -C "$PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null || echo "
 # FUTURATERM_MAS_SIGNING_CERT_PASSWORD, FUTURATERM_MAS_PROVISIONING_PROFILE,
 # FUTURATERM_DEVELOPMENT_TEAM.
 # Do not hardcode Apple Team IDs or account emails in this public repo.
+# If the identity env var is unset, the first Apple Distribution certificate
+# in the login keychain is used. MAS archives must not fall back to ad-hoc.
+# scripts/mas-export-options.plist ships a teamID placeholder; substitute
+# FUTURATERM_DEVELOPMENT_TEAM before xcodebuild -exportArchive.
 CODESIGN_IDENTITY="${FUTURATERM_MAS_CODESIGN_IDENTITY:-}"
 DEVELOPMENT_TEAM="${FUTURATERM_DEVELOPMENT_TEAM:-}"
 if [[ -z "$CODESIGN_IDENTITY" ]]; then
+  CODESIGN_IDENTITY="$(discover_codesign_identity "Apple Distribution")"
+fi
+if [[ -z "$DEVELOPMENT_TEAM" && -n "$CODESIGN_IDENTITY" ]]; then
+  DEVELOPMENT_TEAM="$(team_id_from_identity "$CODESIGN_IDENTITY")"
+fi
+if [[ -z "$CODESIGN_IDENTITY" ]]; then
   echo "ERROR: Apple Distribution identity not found." >&2
-  echo "Set FUTURATERM_MAS_CODESIGN_IDENTITY (and FUTURATERM_DEVELOPMENT_TEAM) from private CI/secrets." >&2
+  echo "Set FUTURATERM_MAS_CODESIGN_IDENTITY and FUTURATERM_DEVELOPMENT_TEAM, or install an Apple Distribution certificate in the login keychain." >&2
   echo "MAS archives must not fall back to ad-hoc signing." >&2
   exit 1
 fi

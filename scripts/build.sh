@@ -33,10 +33,17 @@ SPARKLE_ED_PUBLIC_KEY="${SPARKLE_ED_PUBLIC_KEY:-SPARKLE_ED_PUBLIC_KEY_PLACEHOLDE
 # FUTURATERM_DEVELOPMENT_TEAM). Ad-hoc is the project.yml default for
 # local/debug/bench. Do not hardcode Team IDs or Apple account emails here.
 #
-# CI imports the .p12 and sets the identity explicitly. Local Release builds
-# should export the same env vars from a private secrets store.
+# CI imports the .p12 and sets the identity explicitly. If the identity env
+# var is unset, the first Developer ID Application certificate in the login
+# keychain is used; otherwise the archive stays ad-hoc.
 CODESIGN_IDENTITY="${FUTURATERM_CODESIGN_IDENTITY:-}"
 DEVELOPMENT_TEAM="${FUTURATERM_DEVELOPMENT_TEAM:-}"
+if [[ -z "$CODESIGN_IDENTITY" ]]; then
+  CODESIGN_IDENTITY="$(discover_codesign_identity "Developer ID Application")"
+fi
+if [[ -z "$DEVELOPMENT_TEAM" && -n "$CODESIGN_IDENTITY" ]]; then
+  DEVELOPMENT_TEAM="$(team_id_from_identity "$CODESIGN_IDENTITY")"
+fi
 SIGNING_OVERRIDES=()
 if [[ -n "$CODESIGN_IDENTITY" ]]; then
   SIGNING_OVERRIDES+=(
